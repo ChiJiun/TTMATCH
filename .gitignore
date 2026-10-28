@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# 競賽資料不重新散布
+data/
+*.csv
+!docs/*.csv
+
+# 訓練產物
+outputs/
+*.npz
+*.npy
+*.pt
+*.pth
+catboost_info/
+
+# 憑證
+kaggle.json
+.env
