@@ -20,6 +20,7 @@ def _trees(kind, **kw):
     def f(D, a):
         from ttmatch.methods.trees import run
         return run(kind, D, a.folds, a.fast, **kw)
+    f.uses_prog = bool(kw.get("use_prog", False))  # arena 依此判斷是否用了比分推移特徵
     return f
 
 
@@ -28,6 +29,7 @@ def _nn(arch, **kw):
         from ttmatch.methods.nn import train_nn
         return train_nn(D, arch=arch, n_folds=a.folds, device=a.device, fast=a.fast,
                         epochs=a.epochs, n_seeds=a.seeds, **kw)
+    f.uses_prog = False
     return f
 
 
@@ -80,6 +82,7 @@ def main():
         out["rally_uid"] = D["ap_base"]["rally_uid"].to_numpy()
         out["prefix_len"] = D["ap_base"]["prefix_len"].to_numpy()
         out["test_rally_uid"] = D["test_pred"]["rally_uid"].to_numpy()
+        out["uses_prog"] = np.array(fn.uses_prog)
         suffix = "_fast" if a.fast else ""
         path = config.OOF_DIR / f"{name}{suffix}.npz"
         np.savez_compressed(path, **out)

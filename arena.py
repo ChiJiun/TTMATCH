@@ -8,7 +8,12 @@
 4. 集成：每個任務各自做貪婪前向選擇（優勝劣汰）——從最佳單一方法開始，只有能讓誠實分數上升的
    方法才會被加入，其餘淘汰。
 
-用法：python arena.py [--fast] [--no-override]
+用法：
+  python arena.py                                         # 全部方法 → outputs/submission.csv
+  python arena.py --exclude lgbm_prog cat_prog --tag noprog
+                                                          # 排除指定方法 → outputs/submission_noprog.csv
+  python arena.py --fast                                  # 讀 *_fast.npz（冒煙測試）
+  python arena.py --no-override                           # 不嘗試規則修正
 """
 from __future__ import annotations
 import argparse
@@ -100,6 +105,28 @@ def load_methods(oof_dir: Path, base: pd.DataFrame, test_uids: np.ndarray, fast:
     return methods
 
 
+def uses_prog(name: str, z: dict) -> bool:
+    """方法是否使用比分推移特徵。新版 npz 由 run_method.py 存 uses_prog 旗標；舊檔依名稱後綴判斷。"""
+    if "uses_prog" in z:
+        return bool(np.asarray(z["uses_prog"]).item())
+    return name.endswith("_prog")
+
+
+def mixed_auc(ev, groups: np.ndarray, main_oof: np.ndarray, plain_oof: np.ndarray,
+              frac: float, repeats: int = 20, seed: int = config.SEED) -> tuple[float, float]:
+    """模擬 test 的情況：隨機挑 frac 比例的 match 改用 plain 集成，其餘用主集成，回傳整體 AUC 的平均與標準差。"""
+    rng = np.random.default_rng(seed)
+    uniq = np.unique(groups)
+    k = int(round(frac * len(uniq)))
+    if k == 0:
+        return float(ev.auc(main_oof)), 0.0
+    scores = []
+    for _ in range(repeats):
+        pick = np.isin(groups, rng.choice(uniq, size=k, replace=False))
+        scores.append(ev.auc(np.where(pick, plain_oof, main_oof)))
+    return float(np.mean(scores)), float(np.std(scores))
+
+
 def greedy_blend(names, oof, test, score_fn, log):
     """貪婪前向選擇：每輪嘗試把一個方法以權重 w 混入目前集成，取最大增益；增益不足即停止。"""
     single = {n: score_fn(oof[n]) for n in names}
@@ -130,6 +157,14 @@ def greedy_blend(names, oof, test, score_fn, log):
     return cur_oof, cur_test, recipe, single
 
 
+def _display_path(p: Path) -> str:
+    """repo 內的路徑顯示相對路徑，否則顯示絕對路徑（設了 TTMATCH_OUT_DIR 時）。"""
+    try:
+        return p.resolve().relative_to(Path(__file__).resolve().parent).as_posix()
+    except ValueError:
+        return str(p.resolve())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fast", action="store_true", help="改讀 *_fast.npz（冒煙測試用）")
@@ -141,9 +176,14 @@ def main():
     D = build_datasets()
     base, test_df = D["ap_base"], D["test_pred"]
     methods = load_methods(config.OOF_DIR, base, test_df["rally_uid"].to_numpy(), args.fast)
-    methods = {n: z for n, z in methods.items() if n not in set(args.exclude)}
     if not methods:
         raise SystemExit("outputs/oof/ 沒有任何 npz，請先執行 run_method.py")
+    unknown = sorted(set(args.exclude) - methods.keys())
+    if unknown:
+        print(f"警告：--exclude 中的 {', '.join(unknown)} 不在 outputs/oof/ 裡，已忽略", flush=True)
+    methods = {n: z for n, z in methods.items() if n not in set(args.exclude)}
+    if not methods:
+        raise SystemExit("--exclude 排除了所有方法，沒有剩下可比較的方法")
     ev = Evaluator(D)
     log, rows = [], []
 
@@ -202,7 +242,7 @@ def main():
     # test 異常 match 的 rally 拿不到比分推移資訊；train 中「沒有下一個 rally」幾乎都在局末，
     # 直接用含比分推移的模型會把它們當成局末。這些列改用不含比分推移特徵的方法另做一組集成。
     unreliable = test_df["prog_unreliable"].to_numpy().astype(bool)
-    plain = [n for n in names if not n.endswith("_prog")]
+    plain = [n for n in names if not uses_prog(n, methods[n])]
     if unreliable.any() and plain and len(plain) < len(names):
         log.append(f"[winner] 不含比分推移的集成（用於 test 異常 match 的 {int(unreliable.sum())} 列）")
         p_oof, p_test, p_recipe, _ = greedy_blend(
@@ -211,8 +251,14 @@ def main():
         final["w"]["test"] = np.where(unreliable, p_test, final["w"]["test"])
         final["w"]["recipe_plain"] = p_recipe
         final["w"]["score_plain"] = ev.auc(p_oof)
+        # CV 的 0.846 假設每一列都有比分推移；test 約 14% 列只能用 plain 集成，而 AUC 是整份一起算
+        frac = float(unreliable.mean())
+        final["w"]["frac_plain"] = frac
+        final["w"]["score_mixed"] = mixed_auc(ev, base["match"].to_numpy(), b_oof, p_oof, frac)
 
     overall = overall_score(final["a"]["score"], final["p"]["score"], final["w"]["score"])
+    overall_mixed = (overall_score(final["a"]["score"], final["p"]["score"], final["w"]["score_mixed"][0])
+                     if "score_mixed" in final["w"] else None)
 
     # --- 3. 產生提交檔：決策規則用全部長度對齊樣本調參 ---
     all_sel = np.concatenate(ev.sel)
@@ -253,13 +299,17 @@ def main():
              f"- winner AUC：{final['w']['score']:.4f}"
              + (f"（test 異常 match 改用不含比分推移的集成，其 CV AUC {final['w']['score_plain']:.4f}）"
                 if "score_plain" in final["w"] else ""),
-             f"- **overall：{overall:.4f}**", "",
+             f"- **overall：{overall:.4f}**",
+             *([f"- 預期 test 表現：test 有 {final['w']['frac_plain']:.1%} 的列改用不含比分推移的集成，"
+                f"在 CV 上隨機挑同比例的 match 模擬，winner AUC 約 {final['w']['score_mixed'][0]:.4f}"
+                f"（±{final['w']['score_mixed'][1]:.4f}），overall 約 {overall_mixed:.4f}"]
+               if overall_mixed is not None else []), "",
              "配方：", "```json",
              json.dumps({**{t: [(n, round(w, 3)) for n, w in final[t]["recipe"]] for t in ("a", "p", "w")},
                          **({"w_plain": [(n, round(w, 3)) for n, w in final["w"]["recipe_plain"]]}
                             if "recipe_plain" in final["w"] else {})},
                         ensure_ascii=False, indent=1), "```", "",
-             f"提交檔：`outputs/{sub_path.name}`"]
+             f"提交檔：`{_display_path(sub_path)}`"]
     report = config.OUT_DIR / f"arena_report{suffix}.md"
     report.write_text("\n".join(lines), encoding="utf-8")
     print("\n".join(lines))

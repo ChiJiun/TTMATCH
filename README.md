@@ -97,7 +97,7 @@ GPU 不夠時，用 [`notebooks/colab_train_nn.ipynb`](notebooks/colab_train_nn.
 | action | transformer 0.38、lgbm_note 0.26、gru_pemb 0.20、xgb 0.16 | 0.3971 |
 | point | lgbm 0.48、gru_mirror 0.32、gru_pemb 0.20 | 0.2023 |
 | winner | cat_prog 0.45、xgb 0.45、transformer 0.10 | 0.8462 |
-| **overall** | | **0.4090** |
+| **overall** | | **0.4090**（test 預期約 0.4055，見已知限制） |
 | overall（不用比分推移，`--exclude lgbm_prog cat_prog`） | winner 改為 cat / lgbm / xgb / transformer | 0.3790 |
 
 分深度決策與規則修正（第 22 名）在 CV 上都沒有帶來穩定增益（< 0.0005），因此未採用。集成分數含選擇偏差，會比單一方法排行榜略為樂觀。
@@ -106,7 +106,7 @@ GPU 不夠時，用 [`notebooks/colab_train_nn.ipynb`](notebooks/colab_train_nn.
 
 1. **選手身分是最重要的訊號之一**：拿掉選手 ID，action F1 從 0.369 掉到 0.312。但第 3 名的選手 target encoding 原寫法有標籤洩漏（訓練列的 TE 含自己的答案），修正成巢狀 OOF 後仍不如直接用原始選手 ID 類別特徵。
 2. **序列模型與樹模型互補**：Transformer 是最佳單一 action 模型，但集成後 action 從 0.383 提升到 0.397；point 則以 LightGBM 為主。
-3. **第 5 名的 Time2Vec + FiLM、第 22 名的鏡像增強**在這裡單獨都沒有勝過基本 GRU，但鏡像版 GRU 在 point 集成中被選入（增加多樣性）。
+3. **第 5 名的 Time2Vec + FiLM、第 22 名的鏡像增強**在這裡單獨的 overall 都沒有勝過基本 GRU（Time2Vec + FiLM 的 winner AUC 0.6497 略高於 GRU 的 0.6463，但 action 較低）；鏡像版 GRU 則在 point 集成中被選入（增加多樣性）。
 4. **比分推移特徵**讓 winner AUC 從 0.70 提升到 0.85，overall 約 +0.03。
 
 ### 已知限制
@@ -116,3 +116,4 @@ GPU 不夠時，用 [`notebooks/colab_train_nn.ipynb`](notebooks/colab_train_nn.
 - CV 無法衡量 test 端「同場比賽資訊」（ap_aug 的 test 內部轉移、test 選手 TE）帶來的好處，實際 test 表現可能與 CV 有落差。
 - 類別權重用整個 ap_base 計算（影響極小）。
 - test 的 match 340–354 資料異常（每場 21–31 位選手），這 262 個 rally 的 winner 只能靠擊球序列預測。
+- 因此上表 winner AUC 0.8462 / overall 0.4090 對 test 偏樂觀：test 有 14.2% 的列只能用不含比分推移的集成（CV AUC 0.6959），而 AUC 是整份 test 一起算。arena 在 CV 上隨機挑同比例的 match 改用該集成模擬，winner AUC 約 0.8285（±0.0016）、overall 約 **0.4055**，這才是較合理的 test 預期。
