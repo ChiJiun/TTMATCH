@@ -39,14 +39,18 @@ METHODS = {
                   _trees("lgbm", targets=("a",), te_alpha=20.0)),
     "lgbm_noplayer": ("LightGBM action/point，不用任何選手 ID 特徵（對照組）",
                       _trees("lgbm", targets=("a", "p"), player_te=False, drop=("next_player",))),
-    "xgb": ("XGBoost 同特徵（lucas6028 多樹模型）", _trees("xgb")),
-    "cat": ("CatBoost 原生類別特徵（lucas6028 多樹模型）", _trees("cat")),
+    # lgbm_note 證實選手 TE 在本資料無益，XGBoost / CatBoost 直接用同一組最佳特徵
+    "xgb": ("XGBoost，特徵同 lgbm_note（lucas6028 多樹模型）", _trees("xgb", player_te=False)),
+    "cat": ("CatBoost 原生類別特徵，特徵同 lgbm_note（lucas6028 多樹模型）", _trees("cat", player_te=False)),
     "lgbm_prog": ("LightGBM winner + 比分推移特徵（本 repo 新增）", _trees("lgbm", targets=("w",), use_prog=True)),
     "cat_prog": ("CatBoost winner + 比分推移特徵（本 repo 新增）", _trees("cat", targets=("w",), use_prog=True)),
     "gru": ("因果 GRU 多任務序列模型（第 3 名 0000workjason）", _nn("gru")),
     "transformer": ("因果 Transformer 多任務序列模型（第 3 名 0000workjason）", _nn("transformer")),
     "gru_t2v_film": ("GRU + Time2Vec + FiLM（第 5 名 SugarSquirrel v8）", _nn("t2v_film")),
-    "gru_mirror": ("GRU + 左右鏡像資料增強（第 22 名 jabir95tsai）", _nn("gru", mirror=True)),
+    "gru_pemb": ("GRU + 選手 ID 嵌入（取代選手 TE，本 repo 新增）", _nn("gru", player_emb=True, player_te=False)),
+    "transformer_pemb": ("因果 Transformer + 選手 ID 嵌入（本 repo 新增）",
+                         _nn("transformer", player_emb=True, player_te=False)),
+    "gru_mirror":("GRU + 左右鏡像資料增強（第 22 名 jabir95tsai）", _nn("gru", mirror=True)),
 }
 
 

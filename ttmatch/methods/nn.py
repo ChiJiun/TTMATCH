@@ -5,6 +5,8 @@
 - t2v_film：Time2Vec 數值嵌入 + FiLM 條件化，改寫自 SugarSquirrel/aicup2026-table-tennis
   （私榜第 5 名）src/gen_submission_v8_t2v_film.py；原作只在最後一拍做 FiLM，這裡改成每個位置都做，
   以符合因果 next-step 訓練
+- player_emb：擊球者 / 對手 ID 嵌入，未見過的選手對應到「未知」，訓練時隨機遮蔽（本 repo 新增；
+  樹模型實驗顯示原始選手 ID 對 action 很重要）
 - mirror：左右鏡像資料增強（落點 1↔3、4↔6、7↔9，站位 1↔3），來自 jabir95tsai/pingpong_aicup_2026（私榜第 22 名）
 """
 from __future__ import annotations
@@ -39,6 +41,7 @@ def _build_records(df: pd.DataFrame):
             action=sub["actionId"].to_numpy(dtype=np.int64),
             point=sub["pointId"].to_numpy(dtype=np.int64),
             pl=sub["next_player"].to_numpy(dtype=np.int64),
+            praw=sub[["gamePlayerId", "gamePlayerOtherId"]].to_numpy(dtype=np.int64),
             win=-1 if pd.isna(w[0]) else int(w[0]), T=len(sub),
         ))
     return recs
@@ -57,7 +60,8 @@ def _mirror(rec):
 
 def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=16,
              fast=False, hidden=160, layers=2, dropout=0.3, lr=2e-3, weight_decay=1e-5,
-             batch_size=128, n_seeds=2, seed=config.SEED, player_te=True, mirror=False):
+             batch_size=128, n_seeds=2, seed=config.SEED, player_te=True, mirror=False,
+             player_emb=False, player_drop=0.15):
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader
@@ -70,6 +74,15 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
     ap_base, test_df, ap_aug = D["ap_base"], D["test_pred"], D.get("ap_aug")
     vocabs = [max(int(trf[c].max()), int(tef[c].max())) + 1 for c in CAT_FEATS]
     emb_dims = [16 if c in ("actionId", "pointId") else 8 for c in CAT_FEATS]
+    sex_i = CAT_FEATS.index("sex")
+    n_cat = len(CAT_FEATS)
+    if player_emb:
+        # 擊球者 / 對手 ID 嵌入：每個 fold 只認得訓練 fold + test 內出現過的選手，其餘對應到 0（未知選手）
+        n_players = int(max(trf["gamePlayerId"].max(), tef["gamePlayerId"].max(),
+                            trf["gamePlayerOtherId"].max(), tef["gamePlayerOtherId"].max())) + 1
+        vocabs += [n_players, n_players]
+        emb_dims += [16, 16]
+        n_cat += 2
     n_scal_base = len(SCALAR_FEATS)
     n_scal = n_scal_base + (config.N_ACTION if player_te else 0)
 
@@ -93,12 +106,17 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
     def _pad(batch, train=False):
         te_key = "te_tr" if train else "te"
         B, T = len(batch), max(r["T"] for r in batch)
-        cats = np.zeros((B, T, len(CAT_FEATS)), np.int64)
+        cats = np.zeros((B, T, n_cat), np.int64)
         scal = np.zeros((B, T, n_scal), np.float32)
         pos = np.zeros((B, T), np.int64)
         for b, r in enumerate(batch):
             t = r["T"]
-            cats[b, :t] = r["cats"]
+            cats[b, :t, :len(CAT_FEATS)] = r["cats"]
+            if player_emb:
+                pid = r["praw"] * known[r["praw"]]
+                if train and np.random.rand() < player_drop:
+                    pid = np.zeros_like(pid)
+                cats[b, :t, len(CAT_FEATS):] = pid
             scal[b, :t, :n_scal_base] = r["scal"]
             if player_te:
                 scal[b, :t, n_scal_base:] = r[te_key]
@@ -198,14 +216,14 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
             t2v_dim = n_scal_base * 8
             self.gru = nn.GRU(self.emb.out_dim + t2v_dim, hidden, num_layers=layers, batch_first=True,
                               dropout=dropout if layers > 1 else 0.0)
-            self.film = nn.Linear(emb_dims[-1] + t2v_dim, 2 * hidden)
+            self.film = nn.Linear(emb_dims[sex_i] + t2v_dim, 2 * hidden)
             self.heads = Heads(hidden)
 
         def forward(self, cats, scal, pos):
             t2v = self.t2v(scal[..., :n_scal_base])
             h, _ = self.gru(torch.cat([self.emb(cats, scal, pos), t2v], -1))
             steps = torch.arange(1, t2v.size(1) + 1, device=t2v.device).view(1, -1, 1)
-            ctx = torch.cat([self.emb.embs[-1](cats[..., -1]), t2v.cumsum(1) / steps], -1)
+            ctx = torch.cat([self.emb.embs[sex_i](cats[..., sex_i]), t2v.cumsum(1) / steps], -1)
             g, b = self.film(ctx).chunk(2, -1)
             return self.heads(h * (1.0 + torch.tanh(g)) + b)
 
@@ -278,6 +296,10 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
                         r["te_tr"] = _lookup(enc_k, prior_k.astype(np.float32), r)
 
         tr_recs = [train_recs[i] for i in tr_i] + test_recs
+        if player_emb:
+            known = np.zeros(n_players, dtype=np.int64)
+            for r in tr_recs:
+                known[r["praw"]] = 1
         if mirror:
             tr_recs = tr_recs + [_mirror(r) for r in tr_recs]
         va_recs = [train_recs[i] for i in va_i]
