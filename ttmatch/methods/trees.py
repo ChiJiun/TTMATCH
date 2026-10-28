@@ -12,7 +12,7 @@ import pandas as pd
 from .. import config
 from ..cv import get_folds
 from ..features import (CATEGORICAL, PROG_FEATURES, get_X,
-                        fit_target_encoding, apply_target_encoding)
+                        fit_target_encoding, apply_target_encoding, oof_target_encoding)
 
 ACTION_TE_KEYS = [["next_player"], ["next_player", "last_action"], ["next_player", "next_strikeId"]]
 
@@ -72,8 +72,10 @@ def _fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast):
     if kind == "cat":
         from catboost import CatBoostClassifier
         cats = [c for c in CATEGORICAL if c in X_tr.columns]
+        # 多類別 + 大量類別特徵時 CTR 計算很慢：限制 CTR 組合、小詞彙類別改 one-hot
         m = CatBoostClassifier(
-            iterations=150 if fast else 1500, learning_rate=0.08, depth=7,
+            iterations=150 if fast else 700, learning_rate=0.12, depth=6,
+            max_ctr_complexity=1, one_hot_max_size=20,
             loss_function="MultiClass" if n_class > 2 else "Logloss",
             eval_metric="MultiClass" if n_class > 2 else "AUC",
             random_seed=config.SEED, thread_count=-1, verbose=False,
@@ -109,7 +111,11 @@ def train_multiclass(kind, D, target_col, classes, n_folds=config.N_FOLDS, fast=
         encoders = [(k, *fit_target_encoding(src_tr, target_col, classes, k, te_alpha))
                     for k in (te_keys or [])]
         va_df = base_df.iloc[va_idx]
-        X_tr = _with_te(get_X(src_tr), src_tr, encoders, classes, "te")
+        # 訓練列的 TE 用巢狀 OOF；驗證列與 test 用整個訓練 fold fit 的編碼
+        X_tr = pd.concat([get_X(src_tr).reset_index(drop=True)] + [
+            pd.DataFrame(oof_target_encoding(src_tr, target_col, classes, k, te_alpha, src_tr["match"]),
+                         columns=[f"te{i}_p{j}" for j in range(C)])
+            for i, k in enumerate(te_keys or [])], axis=1)
         X_va = _with_te(get_X(va_df), va_df, encoders, classes, "te")
         X_te = _with_te(get_X(test_df), test_df, encoders, classes, "te")
         w_tr = _sample_weights(y_tr, C)
@@ -137,12 +143,12 @@ def train_winner(kind, D, n_folds=config.N_FOLDS, fast=False, use_prog=False):
 
 
 def run(kind, D, n_folds=config.N_FOLDS, fast=False, player_te=True, targets=("a", "p", "w"),
-        use_prog=False):
+        use_prog=False, te_alpha=1.0):
     out = {}
     if "a" in targets:
         out["oof_a"], out["te_a"] = train_multiclass(
             kind, D, "next_action", config.ACTION_CLASSES, n_folds, fast,
-            te_keys=ACTION_TE_KEYS if player_te else None)
+            te_keys=ACTION_TE_KEYS if player_te else None, te_alpha=te_alpha)
     if "p" in targets:
         # 第 3 名的 A/B：選手 TE 對 point 反而 -0.004，因此 point 不加
         out["oof_p"], out["te_p"] = train_multiclass(

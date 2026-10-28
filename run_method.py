@@ -35,7 +35,9 @@ def _nn(arch, **kw):
 METHODS = {
     "lgbm": ("LightGBM + 選手 TE + test 轉移擴充（第 3 名 0000workjason）", _trees("lgbm")),
     "lgbm_note": ("LightGBM，不加選手 TE（對照組，檢驗第 3 名的選手 TE 是否有效）", _trees("lgbm", player_te=False)),
-    "xgb": ("XGBoost 同特徵（lucas6028 多樹模型）", _trees("xgb")),
+    "lgbm_te20": ("LightGBM action，選手 TE 改用較強平滑 alpha=20（本 repo 調整）",
+                  _trees("lgbm", targets=("a",), te_alpha=20.0)),
+    "xgb":("XGBoost 同特徵（lucas6028 多樹模型）", _trees("xgb")),
     "cat": ("CatBoost 原生類別特徵（lucas6028 多樹模型）", _trees("cat")),
     "lgbm_prog": ("LightGBM winner + 比分推移特徵（本 repo 新增）", _trees("lgbm", targets=("w",), use_prog=True)),
     "cat_prog": ("CatBoost winner + 比分推移特徵（本 repo 新增）", _trees("cat", targets=("w",), use_prog=True)),

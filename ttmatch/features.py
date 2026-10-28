@@ -224,6 +224,20 @@ def fit_target_encoding(df, target_col, classes, key_cols, alpha=20.0):
     return enc, prior
 
 
+def oof_target_encoding(df, target_col, classes, key_cols, alpha, groups, n_inner=5):
+    """訓練列自己的 TE 必須用巢狀 OOF 計算（依 match 分組的內層 fold），否則每列的 TE 含有自己的答案，
+    模型會過度信任這個特徵。原第 3 名作法直接用整個訓練集 fit 再套回訓練列，在本資料上反而讓 action 退步。"""
+    from sklearn.model_selection import GroupKFold
+    C = len(classes)
+    out = np.empty((len(df), C), dtype=np.float32)
+    groups = np.asarray(groups)
+    n_inner = min(n_inner, len(np.unique(groups)))
+    for tr, va in GroupKFold(n_splits=n_inner).split(df, groups=groups):
+        enc, prior = fit_target_encoding(df.iloc[tr], target_col, classes, key_cols, alpha)
+        out[va] = apply_target_encoding(df.iloc[va], enc, prior, key_cols, classes, "x").to_numpy()
+    return out
+
+
 def apply_target_encoding(df, enc, prior, key_cols, classes, prefix):
     C = len(classes)
     out = np.empty((len(df), C), dtype=np.float32)

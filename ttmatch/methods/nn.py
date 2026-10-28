@@ -90,7 +90,8 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
     te_idx = {u: i for i, u in enumerate(test_df["rally_uid"].to_numpy())}
     te_klen = dict(zip(test_df["rally_uid"].to_numpy(), test_df["prefix_len"].to_numpy().astype(int)))
 
-    def _pad(batch):
+    def _pad(batch, train=False):
+        te_key = "te_tr" if train else "te"
         B, T = len(batch), max(r["T"] for r in batch)
         cats = np.zeros((B, T, len(CAT_FEATS)), np.int64)
         scal = np.zeros((B, T, n_scal), np.float32)
@@ -100,12 +101,12 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
             cats[b, :t] = r["cats"]
             scal[b, :t, :n_scal_base] = r["scal"]
             if player_te:
-                scal[b, :t, n_scal_base:] = r["te"]
+                scal[b, :t, n_scal_base:] = r[te_key]
             pos[b, :t] = r["pos"]
         return cats, scal, pos
 
     def collate(batch):
-        cats, scal, pos = _pad(batch)
+        cats, scal, pos = _pad(batch, train=True)
         B, T = pos.shape
         ta = np.full((B, T), -100, np.int64)
         tp = np.full((B, T), -100, np.int64)
@@ -250,14 +251,31 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
 
     for fold, (tr_i, va_i) in enumerate(get_folds(train_match, n_folds)):
         if player_te:
-            # P(action | next_player) 只用本 fold 訓練場次（+ test 內部轉移）fit
+            # P(action | next_player) 只用本 fold 訓練場次（+ test 內部轉移）fit。
+            # 訓練用的 te_tr 以巢狀 OOF（內層依 match 分 5 份）計算，避免每拍的 TE 含有自己的答案；
+            # 推論用的 te 則用整個訓練 fold fit。
             src = ap_base[ap_base["match"].isin(set(train_match[tr_i].tolist()))]
             if ap_aug is not None:
                 src = pd.concat([src, ap_aug], ignore_index=True)
+
+            def _lookup(enc, prior, r):
+                return np.array([enc.get((int(p),), prior) for p in r["pl"]], dtype=np.float32)
+
             enc, prior = fit_target_encoding(src, "next_action", config.ACTION_CLASSES, ["next_player"])
-            prior = prior.astype(np.float32)
             for r in train_recs + test_recs:
-                r["te"] = np.array([enc.get((int(p),), prior) for p in r["pl"]], dtype=np.float32)
+                r["te"] = _lookup(enc, prior.astype(np.float32), r)
+            fit_recs = [train_recs[i] for i in tr_i] + test_recs
+            for r in fit_recs:  # 不在 src 的場次（沒有任何可訓練的轉移）沿用 te，本身也沒有標籤可洩漏
+                r["te_tr"] = r["te"]
+            src_matches = np.array(sorted(src["match"].unique()))
+            inner = np.random.default_rng(seed + fold).permutation(len(src_matches)) % 5
+            for k in range(5):
+                hold = set(src_matches[inner == k].tolist())
+                enc_k, prior_k = fit_target_encoding(src[~src["match"].isin(hold)], "next_action",
+                                                     config.ACTION_CLASSES, ["next_player"])
+                for r in fit_recs:
+                    if r["match"] in hold:
+                        r["te_tr"] = _lookup(enc_k, prior_k.astype(np.float32), r)
 
         tr_recs = [train_recs[i] for i in tr_i] + test_recs
         if mirror:
