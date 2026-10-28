@@ -139,8 +139,12 @@ def _rally_table(df: pd.DataFrame) -> pd.DataFrame:
         "numberGame": first["numberGame"].to_numpy(),
         "rally_id": first["rally_id"].to_numpy(),
         "server": first["gamePlayerId"].to_numpy(),
+        "pair": [frozenset(p) for p in zip(first["gamePlayerId"], first["gamePlayerOtherId"])],
         "srv_score": first["scoreSelf"].to_numpy(),
         "rcv_score": first["scoreOther"].to_numpy(),
+        # 正常資料中 rally_id 就是局內第幾分，等於開局比分總和 + 1；test 的 match 340–354 不符合
+        # （每個「match」混了 20 多位選手、rally_id 與比分對不上，像是被打散重編號的 rally）
+        "consistent": (first["rally_id"] - 1 == first["scoreSelf"] + first["scoreOther"]).to_numpy(),
     })
 
 
@@ -154,6 +158,11 @@ def _gain(cur: pd.DataFrame, nxt: pd.DataFrame):
 
 def _prog_frame(cur: pd.DataFrame, nxt: pd.DataFrame, has: np.ndarray, gap: np.ndarray):
     a, b = _gain(cur, nxt)
+    # 一致性檢查：同一對選手、兩個 rally 的 rally_id 都與比分一致、得分非負且總和等於間隔；
+    # 不通過就當作沒有下一個 rally，避免異常資料產生訓練時從未見過的值
+    has = (has & (cur["pair"].to_numpy() == nxt["pair"].to_numpy())
+           & cur["consistent"].to_numpy() & nxt["consistent"].to_numpy().astype(bool)
+           & (a >= 0) & (b >= 0) & (a + b == np.nan_to_num(gap, nan=-1)))
     a = np.where(has, a, np.nan).astype(float)
     b = np.where(has, b, np.nan).astype(float)
     tot = a + b
@@ -167,8 +176,11 @@ def _prog_frame(cur: pd.DataFrame, nxt: pd.DataFrame, has: np.ndarray, gap: np.n
 
 
 def test_gap_distribution(test_df: pd.DataFrame) -> dict:
-    """test 內同一局相鄰可見 rally 的 rally_id 間隔分佈；最後一個可見 rally 記為 gap=0（沒有下一個）。"""
-    rt = _rally_table(test_df).sort_values(["match", "numberGame", "rally_id"])
+    """test 內同一局相鄰可見 rally 的 rally_id 間隔分佈；最後一個可見 rally 記為 gap=0（沒有下一個）。
+    只統計 rally_id 與比分一致的正常 match。"""
+    rt = _rally_table(test_df)
+    bad = rt.groupby("match")["consistent"].transform("mean") < 0.5
+    rt = rt[~bad].sort_values(["match", "numberGame", "rally_id"])
     d = rt.groupby(["match", "numberGame"])["rally_id"].diff(-1).mul(-1)
     d = d.fillna(0).astype(int)
     vc = d.value_counts(normalize=True)
@@ -181,7 +193,8 @@ def score_progression_test(test_df: pd.DataFrame) -> pd.DataFrame:
     nxt = rt.groupby(["match", "numberGame"]).shift(-1)
     has = nxt["rally_id"].notna().to_numpy()
     gap = (nxt["rally_id"] - rt["rally_id"]).to_numpy()
-    nxt = nxt.fillna(0)
+    nxt = nxt.fillna({"server": -1, "srv_score": 0, "rcv_score": 0, "consistent": False})
+    nxt["pair"] = [p if isinstance(p, frozenset) else frozenset() for p in nxt["pair"]]
     return _prog_frame(rt, nxt, has, gap)
 
 
@@ -194,13 +207,23 @@ def score_progression_train(train_df: pd.DataFrame, gap_dist: dict, seed: int = 
     gaps = np.array(sorted(g for g in gap_dist if g > 0))
     probs = np.array([gap_dist[g] for g in gaps])
     draw = rng.choice(gaps, size=len(rt), p=probs / probs.sum())
-    key = {(m, n, r): i for i, (m, n, r) in
-           enumerate(zip(rt["match"], rt["numberGame"], rt["rally_id"]))}
-    idx = np.array([key.get((m, n, r + g), -1) if g > 0 else -1
-                    for m, n, r, g in zip(rt["match"], rt["numberGame"], rt["rally_id"], draw)])
+    # train 有些局中間缺 rally：r+g 不存在時取該局 rally_id >= r+g 的第一個 rally，
+    # 只有局末之後才算沒有下一個（與 test 只在局末出現 gap=0 一致）
+    games = {}
+    for i, (m, n, r) in enumerate(zip(rt["match"], rt["numberGame"], rt["rally_id"])):
+        games.setdefault((m, n), []).append((r, i))
+    games = {k: (np.array([r for r, _ in sorted(v)]), np.array([i for _, i in sorted(v)]))
+             for k, v in games.items()}
+    idx = np.full(len(rt), -1)
+    for i, (m, n, r, g) in enumerate(zip(rt["match"], rt["numberGame"], rt["rally_id"], draw)):
+        ids, rows = games[(m, n)]
+        j = np.searchsorted(ids, r + g)
+        if j < len(ids):
+            idx[i] = rows[j]
     has = idx >= 0
     nxt = rt.iloc[np.where(has, idx, 0)].reset_index(drop=True)
-    return _prog_frame(rt, nxt, has, draw.astype(float))
+    gap = np.where(has, nxt["rally_id"].to_numpy() - rt["rally_id"].to_numpy(), np.nan)
+    return _prog_frame(rt, nxt, has, gap)
 
 
 # --- OOF target encoding（必須只用該 fold 的訓練列 fit）----------------------

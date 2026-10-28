@@ -35,6 +35,18 @@ def test_score_progression_reads_next_visible_rally():
     assert gap_distribution(df) == {3: 1 / 3, 1: 1 / 3, 0: 1 / 3}
 
 
+def test_score_progression_rejects_inconsistent_rallies():
+    df = pd.DataFrame([
+        _rally(20, 1, 7, 8, 0, 0),
+        _rally(21, 4, 30, 31, 2, 1),   # 同一局卻換了一對選手（test 的異常 match）
+        _rally(22, 6, 30, 31, 9, 3),   # rally_id 與比分不一致
+        _rally(23, 9, 30, 31, 9, 4),
+    ])
+    out = score_progression_test(df).set_index("rally_uid")
+    assert (out["prog_has_next"] == 0).all()
+    assert out["prog_frac"].isna().all()
+
+
 def test_mirror_is_involution():
     assert (POINT_MIRROR[POINT_MIRROR] == np.arange(10)).all()
     assert (POSITION_MIRROR[POSITION_MIRROR] == np.arange(4)).all()
