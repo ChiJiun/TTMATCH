@@ -88,8 +88,9 @@ def _fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast):
 
 
 def train_multiclass(kind, D, target_col, classes, n_folds=config.N_FOLDS, fast=False,
-                     te_keys=None, te_alpha=1.0, aug_weight_mult=5.0, use_aug=True):
-    """回傳 (oof, test_pred)，欄位順序 = classes。"""
+                     te_keys=None, te_alpha=1.0, aug_weight_mult=5.0, use_aug=True, drop=()):
+    """回傳 (oof, test_pred)，欄位順序 = classes。drop：要拿掉的特徵欄。"""
+    _X = lambda df: get_X(df).drop(columns=list(drop))
     base_df, test_df = D["ap_base"], D["test_pred"]
     aug_df = D["ap_aug"] if use_aug else None
     C = len(classes)
@@ -112,12 +113,12 @@ def train_multiclass(kind, D, target_col, classes, n_folds=config.N_FOLDS, fast=
                     for k in (te_keys or [])]
         va_df = base_df.iloc[va_idx]
         # 訓練列的 TE 用巢狀 OOF；驗證列與 test 用整個訓練 fold fit 的編碼
-        X_tr = pd.concat([get_X(src_tr).reset_index(drop=True)] + [
+        X_tr = pd.concat([_X(src_tr).reset_index(drop=True)] + [
             pd.DataFrame(oof_target_encoding(src_tr, target_col, classes, k, te_alpha, src_tr["match"]),
                          columns=[f"te{i}_p{j}" for j in range(C)])
             for i, k in enumerate(te_keys or [])], axis=1)
-        X_va = _with_te(get_X(va_df), va_df, encoders, classes, "te")
-        X_te = _with_te(get_X(test_df), test_df, encoders, classes, "te")
+        X_va = _with_te(_X(va_df), va_df, encoders, classes, "te")
+        X_te = _with_te(_X(test_df), test_df, encoders, classes, "te")
         w_tr = _sample_weights(y_tr, C)
         w_tr[n_base:] *= aug_weight_mult
         y_va = np.array([c2i.get(v, 0) for v in yb[va_idx]])
@@ -143,16 +144,16 @@ def train_winner(kind, D, n_folds=config.N_FOLDS, fast=False, use_prog=False):
 
 
 def run(kind, D, n_folds=config.N_FOLDS, fast=False, player_te=True, targets=("a", "p", "w"),
-        use_prog=False, te_alpha=1.0):
+        use_prog=False, te_alpha=1.0, drop=()):
     out = {}
     if "a" in targets:
         out["oof_a"], out["te_a"] = train_multiclass(
             kind, D, "next_action", config.ACTION_CLASSES, n_folds, fast,
-            te_keys=ACTION_TE_KEYS if player_te else None, te_alpha=te_alpha)
+            te_keys=ACTION_TE_KEYS if player_te else None, te_alpha=te_alpha, drop=drop)
     if "p" in targets:
         # 第 3 名的 A/B：選手 TE 對 point 反而 -0.004，因此 point 不加
         out["oof_p"], out["te_p"] = train_multiclass(
-            kind, D, "next_point", config.POINT_CLASSES, n_folds, fast)
+            kind, D, "next_point", config.POINT_CLASSES, n_folds, fast, drop=drop)
     if "w" in targets:
         out["oof_w"], out["te_w"] = train_winner(kind, D, n_folds, fast, use_prog)
     return out
