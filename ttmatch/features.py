@@ -175,12 +175,18 @@ def _prog_frame(cur: pd.DataFrame, nxt: pd.DataFrame, has: np.ndarray, gap: np.n
     })
 
 
+def inconsistent_matches(df: pd.DataFrame) -> set:
+    """rally_id 與比分大多對不上的 match（test 的 340–354），其 rally 拿不到比分推移資訊。"""
+    rt = _rally_table(df)
+    rate = rt.groupby("match")["consistent"].mean()
+    return set(rate[rate < 0.5].index.tolist())
+
+
 def test_gap_distribution(test_df: pd.DataFrame) -> dict:
     """test 內同一局相鄰可見 rally 的 rally_id 間隔分佈；最後一個可見 rally 記為 gap=0（沒有下一個）。
     只統計 rally_id 與比分一致的正常 match。"""
     rt = _rally_table(test_df)
-    bad = rt.groupby("match")["consistent"].transform("mean") < 0.5
-    rt = rt[~bad].sort_values(["match", "numberGame", "rally_id"])
+    rt = rt[~rt["match"].isin(inconsistent_matches(test_df))].sort_values(["match", "numberGame", "rally_id"])
     d = rt.groupby(["match", "numberGame"])["rally_id"].diff(-1).mul(-1)
     d = d.fillna(0).astype(int)
     vc = d.value_counts(normalize=True)

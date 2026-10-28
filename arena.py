@@ -134,11 +134,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fast", action="store_true", help="改讀 *_fast.npz（冒煙測試用）")
     ap.add_argument("--no-override", action="store_true")
+    ap.add_argument("--exclude", nargs="*", default=[], help="不納入比較的方法名稱，例如 lgbm_prog cat_prog")
+    ap.add_argument("--tag", default="", help="輸出檔名後綴，例如 noprog → submission_noprog.csv")
     args = ap.parse_args()
 
     D = build_datasets()
     base, test_df = D["ap_base"], D["test_pred"]
     methods = load_methods(config.OOF_DIR, base, test_df["rally_uid"].to_numpy(), args.fast)
+    methods = {n: z for n, z in methods.items() if n not in set(args.exclude)}
     if not methods:
         raise SystemExit("outputs/oof/ 沒有任何 npz，請先執行 run_method.py")
     ev = Evaluator(D)
@@ -159,7 +162,12 @@ def main():
             r["overall"] = overall_score(r["action_tuned"], r["point_tuned"], r["winner_auc"])
         rows.append(r)
         print(f"   評估 {name} 完成", flush=True)
-    board = pd.DataFrame(rows).set_index("method").sort_values("overall", ascending=False, na_position="last")
+    board = pd.DataFrame(rows).set_index("method")
+    if "overall" in board.columns:
+        board = board.sort_values("overall", ascending=False, na_position="last")
+    for key in ("oof_a", "oof_p", "oof_w"):
+        if not any(key in z for z in methods.values()):
+            raise SystemExit(f"沒有任何方法提供 {key}，無法產生提交檔")
 
     # --- 2. 各任務貪婪集成 ---
     final = {}
@@ -191,6 +199,18 @@ def main():
         names, {n: methods[n]["oof_w"] for n in names}, {n: methods[n]["te_w"] for n in names},
         ev.auc, log)
     final["w"] = dict(oof=b_oof, test=b_test, recipe=recipe, score=ev.auc(b_oof))
+    # test 異常 match 的 rally 拿不到比分推移資訊；train 中「沒有下一個 rally」幾乎都在局末，
+    # 直接用含比分推移的模型會把它們當成局末。這些列改用不含比分推移特徵的方法另做一組集成。
+    unreliable = test_df["prog_unreliable"].to_numpy().astype(bool)
+    plain = [n for n in names if not n.endswith("_prog")]
+    if unreliable.any() and plain and len(plain) < len(names):
+        log.append(f"[winner] 不含比分推移的集成（用於 test 異常 match 的 {int(unreliable.sum())} 列）")
+        p_oof, p_test, p_recipe, _ = greedy_blend(
+            plain, {n: methods[n]["oof_w"] for n in plain}, {n: methods[n]["te_w"] for n in plain},
+            ev.auc, log)
+        final["w"]["test"] = np.where(unreliable, p_test, final["w"]["test"])
+        final["w"]["recipe_plain"] = p_recipe
+        final["w"]["score_plain"] = ev.auc(p_oof)
 
     overall = overall_score(final["a"]["score"], final["p"]["score"], final["w"]["score"])
 
@@ -214,24 +234,33 @@ def main():
     sub["serverGetPoint"] = np.clip(final["w"]["test"], 0, 1)
     assert sub["rally_uid"].tolist() == D["sample"]["rally_uid"].tolist()
     config.OUT_DIR.mkdir(parents=True, exist_ok=True)
-    sub_path = config.OUT_DIR / ("submission_fast.csv" if args.fast else "submission.csv")
+    suffix = ("_fast" if args.fast else "") + (f"_{args.tag}" if args.tag else "")
+    sub_path = config.OUT_DIR / f"submission{suffix}.csv"
     sub.to_csv(sub_path, index=False)
 
     # --- 4. 報告 ---
     fmt = board.round(4)
-    lines = ["# Arena 報告", "", "## 單一方法（同一套 CV、決策規則跨半調參）", "",
+    lines = ["# Arena 報告", "",
+             *([f"排除的方法：{', '.join(args.exclude)}", ""] if args.exclude else []),
+             "## 單一方法（同一套 CV、決策規則跨半調參）", "",
              fmt.to_markdown(), "", "## 集成過程", "", "```", *log, "```", "",
-             "## 最終集成（誠實 CV）", "",
+             "## 最終集成", "",
+             "以下分數的決策規則仍是跨半調參，但集成成員、權重、分深度決策與規則修正都是依同一套分數挑選的，"
+             "因此含選擇偏差、會略為樂觀；單一方法排行榜沒有這層選擇。", "",
              *[f"- {lab} Macro-F1：{final[t]['score']:.4f}"
                f"（分深度決策：{'是' if final[t]['depth'] else '否'}；規則修正：{'是' if final[t]['override'] else '否'}）"
                for t, lab in (("a", "action"), ("p", "point"))],
-             f"- winner AUC：{final['w']['score']:.4f}",
+             f"- winner AUC：{final['w']['score']:.4f}"
+             + (f"（test 異常 match 改用不含比分推移的集成，其 CV AUC {final['w']['score_plain']:.4f}）"
+                if "score_plain" in final["w"] else ""),
              f"- **overall：{overall:.4f}**", "",
              "配方：", "```json",
-             json.dumps({t: [(n, round(w, 3)) for n, w in final[t]["recipe"]] for t in ("a", "p", "w")},
+             json.dumps({**{t: [(n, round(w, 3)) for n, w in final[t]["recipe"]] for t in ("a", "p", "w")},
+                         **({"w_plain": [(n, round(w, 3)) for n, w in final["w"]["recipe_plain"]]}
+                            if "recipe_plain" in final["w"] else {})},
                         ensure_ascii=False, indent=1), "```", "",
              f"提交檔：`outputs/{sub_path.name}`"]
-    report = config.OUT_DIR / ("arena_report_fast.md" if args.fast else "arena_report.md")
+    report = config.OUT_DIR / f"arena_report{suffix}.md"
     report.write_text("\n".join(lines), encoding="utf-8")
     print("\n".join(lines))
 
