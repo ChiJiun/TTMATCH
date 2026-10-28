@@ -56,3 +56,38 @@ def tune_decision(probs, y_true, classes, n_coord_passes: int = 2, alpha_grid=AL
         if f > best_f:
             best_f, alpha = f, a
     return (alpha, logw), best_f
+
+
+# --- 依前綴深度分桶的決策：接發球、第三板、相持段的下一拍類別組成差很多 ---
+DEPTH_BUCKETS = ((1, 1), (2, 2), (3, 999))
+
+
+def _bucket_id(prefix_len):
+    pl = np.asarray(prefix_len)
+    bid = np.full(len(pl), len(DEPTH_BUCKETS) - 1, dtype=int)
+    for i, (lo, hi) in enumerate(DEPTH_BUCKETS):
+        bid[(pl >= lo) & (pl <= hi)] = i
+    return bid
+
+
+def tune_decision_by_depth(probs, y_true, classes, prefix_len, n_coord_passes: int = 2,
+                           min_rows: int = 300):
+    """每個深度桶各自調參；樣本太少的桶沿用全域決策。回傳 dict(bucket -> decision)。"""
+    y_true = np.asarray(y_true)
+    glob, _ = tune_decision(probs, y_true, classes, n_coord_passes)
+    bid = _bucket_id(prefix_len)
+    decs = {}
+    for i in range(len(DEPTH_BUCKETS)):
+        m = bid == i
+        decs[i] = tune_decision(probs[m], y_true[m], classes, n_coord_passes)[0] if m.sum() >= min_rows else glob
+    return decs
+
+
+def apply_decision_by_depth(probs, classes, decs, prefix_len):
+    bid = _bucket_id(prefix_len)
+    pred = np.empty(len(probs), dtype=int)
+    for i, dec in decs.items():
+        m = bid == i
+        if m.any():
+            pred[m] = apply_decision(probs[m], classes, dec)
+    return pred

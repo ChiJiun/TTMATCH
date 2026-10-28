@@ -22,7 +22,8 @@ from sklearn.model_selection import GroupKFold
 from ttmatch import config
 from ttmatch.cv import length_matched_indices
 from ttmatch.data import build_datasets, test_length_probs
-from ttmatch.decision import tune_decision, apply_decision
+from ttmatch.decision import (tune_decision, apply_decision,
+                              tune_decision_by_depth, apply_decision_by_depth)
 from ttmatch.metrics import macro_f1, winner_auc, overall_score
 from ttmatch.postprocess import fit_table, apply_override
 
@@ -49,16 +50,24 @@ class Evaluator:
         evals = [s[self.half[s] == h] for s in self.sel]
         return tune, evals
 
-    def f1(self, probs, task, quick=False, override_tables=None):
-        """誠實的 Macro-F1：決策規則在另一半調參。"""
+    def f1(self, probs, task, quick=False, override_tables=None, depth=False):
+        """誠實的 Macro-F1：決策規則在另一半調參。depth=True 時依前綴深度分桶調參。"""
         classes = TASKS[task][1]
         y = self.y[task]
+        plen = self.base["prefix_len"].to_numpy()
+        passes = 0 if quick else 2
         scores = []
         for h in (0, 1):
             tune, evals = self._split(h)
-            dec, _ = tune_decision(probs[tune], y[tune], classes, n_coord_passes=0 if quick else 2)
+            if depth:
+                decs = tune_decision_by_depth(probs[tune], y[tune], classes, plen[tune], passes)
+            else:
+                dec, _ = tune_decision(probs[tune], y[tune], classes, n_coord_passes=passes)
             for ev in evals:
-                pred = apply_decision(probs[ev], classes, dec)
+                if depth:
+                    pred = apply_decision_by_depth(probs[ev], classes, decs, plen[ev])
+                else:
+                    pred = apply_decision(probs[ev], classes, dec)
                 if override_tables is not None:
                     pred = apply_override(self.base.iloc[ev], pred, override_tables[h])
                 scores.append(macro_f1(y[ev], pred))
@@ -162,14 +171,19 @@ def main():
         b_oof, b_test, recipe, _ = greedy_blend(
             names, oof, test, lambda p, t=task: ev.f1(p, t, quick=True), log)
         score = ev.f1(b_oof, task)
+        s_depth = ev.f1(b_oof, task, depth=True)
+        log.append(f"  決策規則：全域 {score:.4f} / 分深度 {s_depth:.4f}")
+        use_depth = s_depth > score + MIN_GAIN
+        score = max(score, s_depth) if use_depth else score
         use_override = False
         if not args.no_override:
             tables = ev.override_tables(task)
-            s_ov = ev.f1(b_oof, task, override_tables=tables)
+            s_ov = ev.f1(b_oof, task, override_tables=tables, depth=use_depth)
             log.append(f"  規則修正：{score:.4f} → {s_ov:.4f}")
             if s_ov > score + MIN_GAIN:
                 score, use_override = s_ov, True
-        final[task] = dict(oof=b_oof, test=b_test, recipe=recipe, score=score, override=use_override)
+        final[task] = dict(oof=b_oof, test=b_test, recipe=recipe, score=score,
+                           override=use_override, depth=use_depth)
 
     names = [n for n, z in methods.items() if "oof_w" in z]
     log.append("[winner] 貪婪集成（AUC）")
@@ -186,8 +200,14 @@ def main():
     for task, col in (("a", "actionId"), ("p", "pointId")):
         classes = TASKS[task][1]
         y = ev.y[task]
-        dec, _ = tune_decision(final[task]["oof"][all_sel], y[all_sel], classes)
-        pred = apply_decision(final[task]["test"], classes, dec)
+        if final[task]["depth"]:
+            plen = base["prefix_len"].to_numpy()
+            decs = tune_decision_by_depth(final[task]["oof"][all_sel], y[all_sel], classes, plen[all_sel])
+            pred = apply_decision_by_depth(final[task]["test"], classes, decs,
+                                           test_df["prefix_len"].to_numpy())
+        else:
+            dec, _ = tune_decision(final[task]["oof"][all_sel], y[all_sel], classes)
+            pred = apply_decision(final[task]["test"], classes, dec)
         if final[task]["override"]:
             pred = apply_override(test_df, pred, fit_table(base, TASKS[task][0]))
         sub[col] = pred.astype(int)
@@ -202,8 +222,9 @@ def main():
     lines = ["# Arena 報告", "", "## 單一方法（同一套 CV、決策規則跨半調參）", "",
              fmt.to_markdown(), "", "## 集成過程", "", "```", *log, "```", "",
              "## 最終集成（誠實 CV）", "",
-             f"- action Macro-F1：{final['a']['score']:.4f}（規則修正：{'是' if final['a']['override'] else '否'}）",
-             f"- point Macro-F1：{final['p']['score']:.4f}（規則修正：{'是' if final['p']['override'] else '否'}）",
+             *[f"- {lab} Macro-F1：{final[t]['score']:.4f}"
+               f"（分深度決策：{'是' if final[t]['depth'] else '否'}；規則修正：{'是' if final[t]['override'] else '否'}）"
+               for t, lab in (("a", "action"), ("p", "point"))],
              f"- winner AUC：{final['w']['score']:.4f}",
              f"- **overall：{overall:.4f}**", "",
              "配方：", "```json",
