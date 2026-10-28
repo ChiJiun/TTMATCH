@@ -159,7 +159,12 @@ def main():
             r["overall"] = overall_score(r["action_tuned"], r["point_tuned"], r["winner_auc"])
         rows.append(r)
         print(f"   評估 {name} 完成", flush=True)
-    board = pd.DataFrame(rows).set_index("method").sort_values("overall", ascending=False, na_position="last")
+    board = pd.DataFrame(rows).set_index("method")
+    if "overall" in board.columns:
+        board = board.sort_values("overall", ascending=False, na_position="last")
+    for key in ("oof_a", "oof_p", "oof_w"):
+        if not any(key in z for z in methods.values()):
+            raise SystemExit(f"沒有任何方法提供 {key}，無法產生提交檔")
 
     # --- 2. 各任務貪婪集成 ---
     final = {}
@@ -191,6 +196,18 @@ def main():
         names, {n: methods[n]["oof_w"] for n in names}, {n: methods[n]["te_w"] for n in names},
         ev.auc, log)
     final["w"] = dict(oof=b_oof, test=b_test, recipe=recipe, score=ev.auc(b_oof))
+    # test 異常 match 的 rally 拿不到比分推移資訊；train 中「沒有下一個 rally」幾乎都在局末，
+    # 直接用含比分推移的模型會把它們當成局末。這些列改用不含比分推移特徵的方法另做一組集成。
+    unreliable = test_df["prog_unreliable"].to_numpy().astype(bool)
+    plain = [n for n in names if not n.endswith("_prog")]
+    if unreliable.any() and plain and len(plain) < len(names):
+        log.append(f"[winner] 不含比分推移的集成（用於 test 異常 match 的 {int(unreliable.sum())} 列）")
+        p_oof, p_test, p_recipe, _ = greedy_blend(
+            plain, {n: methods[n]["oof_w"] for n in plain}, {n: methods[n]["te_w"] for n in plain},
+            ev.auc, log)
+        final["w"]["test"] = np.where(unreliable, p_test, final["w"]["test"])
+        final["w"]["recipe_plain"] = p_recipe
+        final["w"]["score_plain"] = ev.auc(p_oof)
 
     overall = overall_score(final["a"]["score"], final["p"]["score"], final["w"]["score"])
 
@@ -221,14 +238,20 @@ def main():
     fmt = board.round(4)
     lines = ["# Arena 報告", "", "## 單一方法（同一套 CV、決策規則跨半調參）", "",
              fmt.to_markdown(), "", "## 集成過程", "", "```", *log, "```", "",
-             "## 最終集成（誠實 CV）", "",
+             "## 最終集成", "",
+             "以下分數的決策規則仍是跨半調參，但集成成員、權重、分深度決策與規則修正都是依同一套分數挑選的，"
+             "因此含選擇偏差、會略為樂觀；單一方法排行榜沒有這層選擇。", "",
              *[f"- {lab} Macro-F1：{final[t]['score']:.4f}"
                f"（分深度決策：{'是' if final[t]['depth'] else '否'}；規則修正：{'是' if final[t]['override'] else '否'}）"
                for t, lab in (("a", "action"), ("p", "point"))],
-             f"- winner AUC：{final['w']['score']:.4f}",
+             f"- winner AUC：{final['w']['score']:.4f}"
+             + (f"（test 異常 match 改用不含比分推移的集成，其 CV AUC {final['w']['score_plain']:.4f}）"
+                if "score_plain" in final["w"] else ""),
              f"- **overall：{overall:.4f}**", "",
              "配方：", "```json",
-             json.dumps({t: [(n, round(w, 3)) for n, w in final[t]["recipe"]] for t in ("a", "p", "w")},
+             json.dumps({**{t: [(n, round(w, 3)) for n, w in final[t]["recipe"]] for t in ("a", "p", "w")},
+                         **({"w_plain": [(n, round(w, 3)) for n, w in final["w"]["recipe_plain"]]}
+                            if "recipe_plain" in final["w"] else {})},
                         ensure_ascii=False, indent=1), "```", "",
              f"提交檔：`outputs/{sub_path.name}`"]
     report = config.OUT_DIR / ("arena_report_fast.md" if args.fast else "arena_report.md")

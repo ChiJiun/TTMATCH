@@ -10,7 +10,7 @@ from __future__ import annotations
 import pandas as pd
 
 from . import config
-from .features import (add_features, test_gap_distribution,
+from .features import (add_features, test_gap_distribution, inconsistent_matches,
                        score_progression_train, score_progression_test)
 
 
@@ -40,6 +40,8 @@ def build_datasets(use_test_aug: bool = True) -> dict:
     ap_base["winner"] = ap_base["winner"].astype(int)
     ap_aug = _strip_serve_targets(tef) if use_test_aug else None
     test_pred = tef[~tef["has_next"]].reset_index(drop=True).copy()
+    # 異常 match 的 rally 沒有比分推移資訊，arena 對這些列改用不含比分推移的 winner 集成
+    test_pred["prog_unreliable"] = test_pred["match"].isin(inconsistent_matches(te)).astype(int)
 
     # 提交順序以 sample_submission 為準
     order = {u: i for i, u in enumerate(sample["rally_uid"])}
