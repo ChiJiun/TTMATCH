@@ -134,11 +134,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fast", action="store_true", help="改讀 *_fast.npz（冒煙測試用）")
     ap.add_argument("--no-override", action="store_true")
+    ap.add_argument("--exclude", nargs="*", default=[], help="不納入比較的方法名稱，例如 lgbm_prog cat_prog")
+    ap.add_argument("--tag", default="", help="輸出檔名後綴，例如 noprog → submission_noprog.csv")
     args = ap.parse_args()
 
     D = build_datasets()
     base, test_df = D["ap_base"], D["test_pred"]
     methods = load_methods(config.OOF_DIR, base, test_df["rally_uid"].to_numpy(), args.fast)
+    methods = {n: z for n, z in methods.items() if n not in set(args.exclude)}
     if not methods:
         raise SystemExit("outputs/oof/ 沒有任何 npz，請先執行 run_method.py")
     ev = Evaluator(D)
@@ -231,12 +234,15 @@ def main():
     sub["serverGetPoint"] = np.clip(final["w"]["test"], 0, 1)
     assert sub["rally_uid"].tolist() == D["sample"]["rally_uid"].tolist()
     config.OUT_DIR.mkdir(parents=True, exist_ok=True)
-    sub_path = config.OUT_DIR / ("submission_fast.csv" if args.fast else "submission.csv")
+    suffix = ("_fast" if args.fast else "") + (f"_{args.tag}" if args.tag else "")
+    sub_path = config.OUT_DIR / f"submission{suffix}.csv"
     sub.to_csv(sub_path, index=False)
 
     # --- 4. 報告 ---
     fmt = board.round(4)
-    lines = ["# Arena 報告", "", "## 單一方法（同一套 CV、決策規則跨半調參）", "",
+    lines = ["# Arena 報告", "",
+             *([f"排除的方法：{', '.join(args.exclude)}", ""] if args.exclude else []),
+             "## 單一方法（同一套 CV、決策規則跨半調參）", "",
              fmt.to_markdown(), "", "## 集成過程", "", "```", *log, "```", "",
              "## 最終集成", "",
              "以下分數的決策規則仍是跨半調參，但集成成員、權重、分深度決策與規則修正都是依同一套分數挑選的，"
@@ -254,7 +260,7 @@ def main():
                             if "recipe_plain" in final["w"] else {})},
                         ensure_ascii=False, indent=1), "```", "",
              f"提交檔：`outputs/{sub_path.name}`"]
-    report = config.OUT_DIR / ("arena_report_fast.md" if args.fast else "arena_report.md")
+    report = config.OUT_DIR / f"arena_report{suffix}.md"
     report.write_text("\n".join(lines), encoding="utf-8")
     print("\n".join(lines))
 
