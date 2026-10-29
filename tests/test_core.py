@@ -82,3 +82,37 @@ def test_inconsistent_matches():
 def test_mirror_is_involution():
     assert (POINT_MIRROR[POINT_MIRROR] == np.arange(10)).all()
     assert (POSITION_MIRROR[POSITION_MIRROR] == np.arange(4)).all()
+
+
+def test_uses_prog_flag_and_fallback():
+    from arena import uses_prog
+    assert uses_prog("cat_prog", {}) and not uses_prog("cat", {})
+    # 新版 npz 的旗標優先於名稱
+    assert uses_prog("winner_v2", {"uses_prog": np.array(True)})
+    assert not uses_prog("odd_prog", {"uses_prog": np.array(False)})
+
+
+def test_mixed_auc_interpolates_between_blends():
+    from arena import mixed_auc
+    from sklearn.metrics import roc_auc_score
+
+    class FakeEval:
+        def __init__(self, y):
+            self.y = y
+
+        def auc(self, p):
+            return roc_auc_score(self.y, p)
+
+    rng = np.random.default_rng(0)
+    groups = np.repeat(np.arange(50), 20)
+    y = rng.integers(0, 2, groups.size)
+    good = y + rng.normal(0, 0.3, y.size)    # 幾乎完美
+    plain = rng.normal(0, 1, y.size)          # 隨機
+    ev = FakeEval(y)
+    lo, hi = ev.auc(plain), ev.auc(good)
+    m0, _ = mixed_auc(ev, groups, good, plain, frac=0.0)
+    m1, _ = mixed_auc(ev, groups, good, plain, frac=1.0)
+    m, s = mixed_auc(ev, groups, good, plain, frac=0.2)
+    assert abs(m1 - lo) < 1e-12
+    assert abs(m0 - hi) < 1e-12
+    assert lo < m < hi and s > 0
