@@ -14,9 +14,11 @@
                                                           # 排除指定方法 → outputs/submission_noprog.csv
   python arena.py --fast                                  # 讀 *_fast.npz（冒煙測試）
   python arena.py --no-override                           # 不嘗試規則修正
+  python arena.py --no-nested                             # 跳過巢狀估計
 """
 from __future__ import annotations
 import argparse
+import copy
 import json
 from pathlib import Path
 
@@ -55,14 +57,27 @@ class Evaluator:
         evals = [s[self.half[s] == h] for s in self.sel]
         return tune, evals
 
-    def f1(self, probs, task, quick=False, override_tables=None, depth=False):
-        """誠實的 Macro-F1：決策規則在另一半調參。depth=True 時依前綴深度分桶調參。"""
+    def restricted(self, mask: np.ndarray) -> "Evaluator":
+        """只看 mask 為 True 的列的評估器；兩半在這些列的 match 上重新切（巢狀估計用）。"""
+        sub = copy.copy(self)
+        sub.sel = [s[mask[s]] for s in self.sel]
+        rows = np.where(mask)[0]
+        half = np.zeros(len(self.base), dtype=int)
+        for h, (_, idx) in enumerate(GroupKFold(n_splits=2).split(
+                rows, groups=self.base["match"].to_numpy()[rows])):
+            half[rows[idx]] = h
+        sub.half = half
+        return sub
+
+    def f1(self, probs, task, quick=False, override_tables=None, depth=False, halves=(0, 1)):
+        """誠實的 Macro-F1：決策規則在另一半調參。depth=True 時依前綴深度分桶調參。
+        halves 可只評其中一半（調參仍用另一半）。"""
         classes = TASKS[task][1]
         y = self.y[task]
         plen = self.base["prefix_len"].to_numpy()
         passes = 0 if quick else 2
         scores = []
-        for h in (0, 1):
+        for h in halves:
             tune, evals = self._split(h)
             if depth:
                 decs = tune_decision_by_depth(probs[tune], y[tune], classes, plen[tune], passes)
@@ -83,8 +98,9 @@ class Evaluator:
         y = self.y[task]
         return float(np.mean([macro_f1(y[s], classes[probs[s].argmax(1)]) for s in self.sel]))
 
-    def auc(self, score):
-        return float(np.nanmean([winner_auc(self.y["w"][s], score[s]) for s in self.sel]))
+    def auc(self, score, halves=(0, 1)):
+        return float(np.nanmean([winner_auc(self.y["w"][s[np.isin(self.half[s], halves)]],
+                                            score[s[np.isin(self.half[s], halves)]]) for s in self.sel]))
 
     def override_tables(self, task):
         col = TASKS[task][0]
@@ -125,6 +141,28 @@ def mixed_auc(ev, groups: np.ndarray, main_oof: np.ndarray, plain_oof: np.ndarra
         pick = np.isin(groups, rng.choice(uniq, size=k, replace=False))
         scores.append(ev.auc(np.where(pick, plain_oof, main_oof)))
     return float(np.mean(scores)), float(np.std(scores))
+
+
+def nested_estimate(ev: Evaluator, names, oof, task):
+    """巢狀估計：集成成員、權重與決策規則全部只用「另一半比賽」挑選 / 調參，再在這一半評分，兩半互換。
+
+    回傳 (集成的巢狀分數, 另一半挑出的最佳單一方法在這一半的分數)。
+    主流程的集成分數是用全部 OOF 挑成員，所以略為樂觀；這個數字沒有那層選擇偏差。
+    """
+    blend_scores, single_scores = [], []
+    for h in (0, 1):
+        sel_mask = ev.half != h
+        ev_s = ev.restricted(sel_mask)
+        fn = ev_s.auc if task == "w" else (lambda p, t=task: ev_s.f1(p, t, quick=True))
+        b_oof, _, _, single = greedy_blend(names, oof, oof, fn, log=[])
+        best_single = max(single, key=single.get)
+        if task == "w":
+            blend_scores.append(ev.auc(b_oof, halves=(h,)))
+            single_scores.append(ev.auc(oof[best_single], halves=(h,)))
+        else:
+            blend_scores.append(ev.f1(b_oof, task, halves=(h,)))
+            single_scores.append(ev.f1(oof[best_single], task, halves=(h,)))
+    return float(np.mean(blend_scores)), float(np.mean(single_scores))
 
 
 def greedy_blend(names, oof, test, score_fn, log):
@@ -171,6 +209,7 @@ def main():
     ap.add_argument("--no-override", action="store_true")
     ap.add_argument("--exclude", nargs="*", default=[], help="不納入比較的方法名稱，例如 lgbm_prog cat_prog")
     ap.add_argument("--tag", default="", help="輸出檔名後綴，例如 noprog → submission_noprog.csv")
+    ap.add_argument("--no-nested", action="store_true", help="跳過巢狀估計（省時間）")
     args = ap.parse_args()
 
     D = build_datasets()
@@ -257,6 +296,15 @@ def main():
         final["w"]["score_mixed"] = mixed_auc(ev, base["match"].to_numpy(), b_oof, p_oof, frac)
 
     overall = overall_score(final["a"]["score"], final["p"]["score"], final["w"]["score"])
+
+    # --- 2b. 巢狀估計：集成與決策都在另一半選，在這一半評 ---
+    nested = {}
+    if not args.no_nested:
+        for task, key in (("a", "oof_a"), ("p", "oof_p"), ("w", "oof_w")):
+            names = [n for n, z in methods.items() if key in z]
+            nested[task] = nested_estimate(ev, names, {n: methods[n][key] for n in names}, task)
+            print(f"   巢狀估計 {task} 完成", flush=True)
+        nested["overall"] = overall_score(nested["a"][0], nested["p"][0], nested["w"][0])
     overall_mixed = (overall_score(final["a"]["score"], final["p"]["score"], final["w"]["score_mixed"][0])
                      if "score_mixed" in final["w"] else None)
 
@@ -300,6 +348,10 @@ def main():
              + (f"（test 異常 match 改用不含比分推移的集成，其 CV AUC {final['w']['score_plain']:.4f}）"
                 if "score_plain" in final["w"] else ""),
              f"- **overall：{overall:.4f}**",
+             *([f"- 巢狀估計（成員、權重、決策都只用另一半挑；無選擇偏差）：action {nested['a'][0]:.4f}、"
+                f"point {nested['p'][0]:.4f}、winner {nested['w'][0]:.4f}、**overall {nested['overall']:.4f}**；"
+                f"同樣方式只挑單一最佳方法：action {nested['a'][1]:.4f}、point {nested['p'][1]:.4f}、"
+                f"winner {nested['w'][1]:.4f}"] if nested else []),
              *([f"- 預期 test 表現：test 有 {final['w']['frac_plain']:.1%} 的列改用不含比分推移的集成，"
                 f"在 CV 上隨機挑同比例的 match 模擬，winner AUC 約 {final['w']['score_mixed'][0]:.4f}"
                 f"（±{final['w']['score_mixed'][1]:.4f}），overall 約 {overall_mixed:.4f}"]

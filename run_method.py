@@ -46,6 +46,22 @@ METHODS = {
     "cat": ("CatBoost 原生類別特徵，特徵同 lgbm_note（lucas6028 多樹模型）", _trees("cat", player_te=False)),
     "lgbm_prog": ("LightGBM winner + 比分推移特徵（本 repo 新增）", _trees("lgbm", targets=("w",), use_prog=True)),
     "cat_prog": ("CatBoost winner + 比分推移特徵（本 repo 新增）", _trees("cat", targets=("w",), use_prog=True)),
+    # --- 改善回合 1（本 repo 新增的實驗；全部用 lgbm_note 的特徵，不加選手 TE）---
+    "lgbm_mirror": ("LightGBM action/point + 左右鏡像訓練列（第 22 名的增強套到樹模型）",
+                    _trees("lgbm", targets=("a", "p"), player_te=False, mirror=True)),
+    "lgbm_bag3": ("LightGBM action/point，3 個 seed 平均（seed bagging）",
+                  _trees("lgbm", targets=("a", "p"), player_te=False, n_seeds=3)),
+    "lgbm_reg": ("LightGBM action/point，較強正則化（葉數 31、min_data 80、feature_fraction 0.6、l2 5）",
+                 _trees("lgbm", targets=("a", "p"), player_te=False,
+                        params=dict(num_leaves=31, min_data_in_leaf=80, feature_fraction=0.6, lambda_l2=5.0))),
+    "lgbm_big": ("LightGBM action/point，較大模型（葉數 127、min_data 20、lr 0.03、3000 輪上限）",
+                 _trees("lgbm", targets=("a", "p"), player_te=False,
+                        params=dict(num_leaves=127, min_data_in_leaf=20, learning_rate=0.03, rounds=3000))),
+    "xgb_mirror": ("XGBoost action/point + 左右鏡像訓練列",
+                   _trees("xgb", targets=("a", "p"), player_te=False, mirror=True)),
+    "xgb_prog": ("XGBoost winner + 比分推移特徵", _trees("xgb", targets=("w",), use_prog=True)),
+    "lgbm_prog_bag3": ("LightGBM winner + 比分推移，3 seed", _trees("lgbm", targets=("w",), use_prog=True, n_seeds=3)),
+    "cat_prog_bag3": ("CatBoost winner + 比分推移，3 seed", _trees("cat", targets=("w",), use_prog=True, n_seeds=3)),
     "gru": ("因果 GRU 多任務序列模型（第 3 名 0000workjason）", _nn("gru")),
     "transformer": ("因果 Transformer 多任務序列模型（第 3 名 0000workjason）", _nn("transformer")),
     "gru_t2v_film": ("GRU + Time2Vec + FiLM（第 5 名 SugarSquirrel v8）", _nn("t2v_film")),
@@ -65,6 +81,7 @@ def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--epochs", type=int, default=16)
     ap.add_argument("--seeds", type=int, default=2)
+    ap.add_argument("--suffix", default="", help="輸出檔名後綴，例如 _s3 → outputs/oof/<name>_s3.npz（不覆寫原檔）")
     a = ap.parse_args()
     if a.list or not a.methods:
         for k, (desc, _) in METHODS.items():
@@ -83,7 +100,7 @@ def main():
         out["prefix_len"] = D["ap_base"]["prefix_len"].to_numpy()
         out["test_rally_uid"] = D["test_pred"]["rally_uid"].to_numpy()
         out["uses_prog"] = np.array(fn.uses_prog)
-        suffix = "_fast" if a.fast else ""
+        suffix = a.suffix + ("_fast" if a.fast else "")
         path = config.OOF_DIR / f"{name}{suffix}.npz"
         np.savez_compressed(path, **out)
         print(f"   saved {path.name} ({time.time() - t0:.0f}s)", flush=True)

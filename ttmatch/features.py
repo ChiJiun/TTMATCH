@@ -41,6 +41,18 @@ FEATURES = CATEGORICAL + NUMERIC
 # 比分推移特徵：同一局下一個「可見」rally 的比分，揭露本 rally 誰得分
 PROG_FEATURES = ["prog_has_next", "prog_gap", "prog_srv_gain", "prog_rcv_gain", "prog_frac"]
 
+# 左右鏡像（jabir95tsai/pingpong_aicup_2026，私榜第 22 名）：落點 1↔3、4↔6、7↔9，站位 1↔3
+POINT_MIRROR = np.array([0, 3, 2, 1, 6, 5, 4, 9, 8, 7])
+POSITION_MIRROR = np.array([0, 3, 2, 1])
+
+
+def mirror_raw(df: pd.DataFrame) -> pd.DataFrame:
+    """把原始擊球表左右鏡像（只動 pointId 與 positionId），其餘欄位不變。"""
+    out = df.copy()
+    out["pointId"] = POINT_MIRROR[out["pointId"].to_numpy(dtype=int)]
+    out["positionId"] = POSITION_MIRROR[np.clip(out["positionId"].to_numpy(dtype=int), 0, 3)]
+    return out
+
 
 def add_features(df: pd.DataFrame, has_winner: bool = True) -> pd.DataFrame:
     df = df.sort_values(["rally_uid", "strikeNumber"]).reset_index(drop=True).copy()

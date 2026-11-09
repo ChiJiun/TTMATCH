@@ -116,3 +116,54 @@ def test_mixed_auc_interpolates_between_blends():
     assert abs(m1 - lo) < 1e-12
     assert abs(m0 - hi) < 1e-12
     assert lo < m < hi and s > 0
+
+
+def _fake_D(n_matches=8, rallies_per_match=30, seed=0):
+    rng = np.random.default_rng(seed)
+    rows, uid = [], 0
+    for m in range(n_matches):
+        for _ in range(rallies_per_match):
+            for t in range(1, int(rng.integers(1, 5)) + 1):
+                rows.append(dict(rally_uid=uid, match=m, prefix_len=t, next_action=int(rng.integers(0, 15)),
+                                 next_point=int(rng.integers(0, 10)), winner=int(rng.integers(0, 2))))
+            uid += 1
+    tef = pd.DataFrame(dict(rally_uid=np.repeat(np.arange(50), 2), strikeNumber=np.tile([1, 2], 50)))
+    return dict(ap_base=pd.DataFrame(rows), tef=tef)
+
+
+def test_evaluator_halves_and_restricted():
+    from arena import Evaluator
+    D = _fake_D()
+    ev = Evaluator(D, repeats=2)
+    rng = np.random.default_rng(1)
+    p = rng.dirichlet(np.ones(15), len(D["ap_base"]))
+    full = ev.f1(p, "a")
+    assert abs(full - np.mean([ev.f1(p, "a", halves=(0,)), ev.f1(p, "a", halves=(1,))])) < 1e-12
+    # auc(halves=(h,)) 只用第 h 半的列
+    w = rng.random(len(D["ap_base"]))
+    s = ev.sel[0]
+    from sklearn.metrics import roc_auc_score
+    manual = np.mean([roc_auc_score(ev.y["w"][s[ev.half[s] == 0]], w[s[ev.half[s] == 0]]) for s in ev.sel])
+    assert abs(ev.auc(w, halves=(0,)) - manual) < 1e-12
+    # restricted：抽樣列全在 mask 內，且兩半都有列、沿 match 切
+    mask = ev.half != 1
+    sub = ev.restricted(mask)
+    assert all(mask[s].all() for s in sub.sel)
+    rows = np.where(mask)[0]
+    assert set(sub.half[rows]) == {0, 1}
+    m = D["ap_base"]["match"].to_numpy()
+    assert not (set(m[rows][sub.half[rows] == 0]) & set(m[rows][sub.half[rows] == 1]))
+
+
+def test_nested_estimate_returns_scores():
+    from arena import Evaluator, nested_estimate
+    D = _fake_D()
+    ev = Evaluator(D, repeats=2)
+    rng = np.random.default_rng(2)
+    n = len(D["ap_base"])
+    oof = {"m1": rng.dirichlet(np.ones(10), n), "m2": rng.dirichlet(np.ones(10), n)}
+    b, s = nested_estimate(ev, list(oof), oof, "p")
+    assert 0.0 <= b <= 1.0 and 0.0 <= s <= 1.0
+    w = {"m1": rng.random(n), "m2": rng.random(n)}
+    b, s = nested_estimate(ev, list(w), w, "w")
+    assert 0.0 <= b <= 1.0 and 0.0 <= s <= 1.0

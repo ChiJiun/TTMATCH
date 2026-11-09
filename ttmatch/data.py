@@ -11,7 +11,7 @@ import pandas as pd
 
 from . import config
 from .features import (add_features, test_gap_distribution, inconsistent_matches,
-                       score_progression_train, score_progression_test)
+                       score_progression_train, score_progression_test, mirror_raw)
 
 
 def load_raw():
@@ -38,6 +38,10 @@ def build_datasets(use_test_aug: bool = True) -> dict:
 
     ap_base = _strip_serve_targets(trf)
     ap_base["winner"] = ap_base["winner"].astype(int)
+    # 左右鏡像版（只給樹模型當額外訓練列；鏡像不改 actionId，所以列與 ap_base 一一對齊）
+    ap_base_mirror = _strip_serve_targets(add_features(mirror_raw(tr), has_winner=True))
+    assert (ap_base_mirror["rally_uid"].to_numpy() == ap_base["rally_uid"].to_numpy()).all()
+    assert (ap_base_mirror["prefix_len"].to_numpy() == ap_base["prefix_len"].to_numpy()).all()
     ap_aug = _strip_serve_targets(tef) if use_test_aug else None
     test_pred = tef[~tef["has_next"]].reset_index(drop=True).copy()
     # 異常 match 的 rally 沒有比分推移資訊，arena 對這些列改用不含比分推移的 winner 集成
@@ -48,7 +52,7 @@ def build_datasets(use_test_aug: bool = True) -> dict:
     test_pred = (test_pred.assign(_o=test_pred["rally_uid"].map(order))
                  .sort_values("_o").drop(columns="_o").reset_index(drop=True))
 
-    return dict(ap_base=ap_base, ap_aug=ap_aug, test_pred=test_pred,
+    return dict(ap_base=ap_base, ap_base_mirror=ap_base_mirror, ap_aug=ap_aug, test_pred=test_pred,
                 trf=trf, tef=tef, sample=sample, gap_dist=gap_dist)
 
 

@@ -15,7 +15,7 @@ import pandas as pd
 
 from .. import config
 from ..cv import get_folds
-from ..features import fit_target_encoding
+from ..features import fit_target_encoding, POINT_MIRROR, POSITION_MIRROR  # noqa: F401（測試從此匯入）
 
 CAT_FEATS = ["actionId", "pointId", "handId", "strengthId", "spinId",
              "strikeId", "positionId", "sex"]
@@ -23,10 +23,6 @@ SCALAR_FEATS = ["score_diff", "total_points", "striker_is_server",
                 "last_is_attack", "attack_ratio", "cum_attack"]
 SCALAR_DIV = np.array([11.0, 22.0, 1.0, 1.0, 1.0, 10.0], dtype=np.float32)
 POS_CAP = 40
-
-POINT_MIRROR = np.array([0, 3, 2, 1, 6, 5, 4, 9, 8, 7])
-POSITION_MIRROR = np.array([0, 3, 2, 1])
-
 
 def _build_records(df: pd.DataFrame):
     df = df.sort_values(["rally_uid", "strikeNumber"])
