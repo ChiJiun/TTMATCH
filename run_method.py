@@ -14,7 +14,7 @@ import numpy as np
 
 from ttmatch import config
 from ttmatch.data import build_datasets
-from ttmatch.history import HIST_FEATURES
+from ttmatch.history import HIST_FEATURES, OHIST_FEATURES
 
 
 def _trees(kind, **kw):
@@ -74,9 +74,17 @@ METHODS = {
                     _trees("lgbm", targets=("w",), use_prog=True, extra=tuple(HIST_FEATURES))),
     "xgb_hist": ("XGBoost action/point + history 特徵",
                  _trees("xgb", targets=("a", "p"), player_te=False, extra=tuple(HIST_FEATURES))),
+    "xgb_hist2": ("XGBoost action/point + 雙方 history 特徵（下一拍擊球者 + 目前擊球者）",
+                  _trees("xgb", targets=("a", "p"), player_te=False, extra=tuple(HIST_FEATURES + OHIST_FEATURES))),
+    "cat_hist": ("CatBoost action/point + history 特徵",
+                 _trees("cat", targets=("a", "p"), player_te=False, extra=tuple(HIST_FEATURES))),
+    "lgbm_hist2": ("LightGBM action/point + 雙方 history 特徵",
+                   _trees("lgbm", targets=("a", "p"), player_te=False, extra=tuple(HIST_FEATURES + OHIST_FEATURES))),
     "transformer_hist": ("因果 Transformer + history 特徵（每拍附下一拍擊球者的同場傾向）",
                          _nn("transformer", hist=True)),
     "gru_pemb_hist": ("GRU + 選手 ID 嵌入 + history 特徵", _nn("gru", player_emb=True, player_te=False, hist=True)),
+    "transformer_hist2": ("因果 Transformer + 雙方 history 特徵", _nn("transformer", hist="both")),
+    "gru_hist": ("因果 GRU + history 特徵", _nn("gru", hist=True)),
     "gru": ("因果 GRU 多任務序列模型（第 3 名 0000workjason）", _nn("gru")),
     "transformer": ("因果 Transformer 多任務序列模型（第 3 名 0000workjason）", _nn("transformer")),
     "gru_t2v_film": ("GRU + Time2Vec + FiLM（第 5 名 SugarSquirrel v8）", _nn("t2v_film")),

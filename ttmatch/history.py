@@ -24,6 +24,8 @@ _N_ACT, _N_PT = 15, 10    # 歷史統計只看 0–14 的非發球球種與 0–
 HIST_FEATURES = (["hist_n", "hist_attack_rate", "hist_mean_strength"]
                  + [f"hist_act{c}" for c in range(_N_ACT)] + [f"hist_pt{c}" for c in range(_N_PT)])
 HIST_KEYS = ["match", "numberGame", "rally_id", "next_player"]
+# 同一組統計也可以套在「目前擊球者」（對手）身上：欄名加前綴 o
+OHIST_FEATURES = ["o" + c for c in HIST_FEATURES]
 
 
 def test_visible_rally_frac(test_df: pd.DataFrame) -> float:
@@ -114,8 +116,10 @@ def match_history(df: pd.DataFrame, len_probs: dict | None = None, keep_prob: fl
 
 
 def attach_history(feat_df: pd.DataFrame, hist: pd.DataFrame) -> pd.DataFrame:
-    """把 match_history 的表合併到特徵表（依 match / numberGame / rally_id / next_player）。"""
+    """把 match_history 的表合併到特徵表兩次：依 next_player（hist_*）與依 cur_player（ohist_*，對手的傾向）。"""
     out = feat_df.merge(hist, on=HIST_KEYS, how="left")
+    oh = hist.rename(columns={"next_player": "cur_player", **{c: "o" + c for c in HIST_FEATURES}})
+    out = out.merge(oh, on=["match", "numberGame", "rally_id", "cur_player"], how="left")
     assert len(out) == len(feat_df)
-    assert not out["hist_n"].isna().any(), "有特徵列對不到歷史統計"
+    assert not out["hist_n"].isna().any() and not out["ohist_n"].isna().any(), "有特徵列對不到歷史統計"
     return out

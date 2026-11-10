@@ -16,7 +16,7 @@ import pandas as pd
 from .. import config
 from ..cv import get_folds
 from ..features import fit_target_encoding, POINT_MIRROR, POSITION_MIRROR  # noqa: F401（測試從此匯入）
-from ..history import HIST_FEATURES
+from ..history import HIST_FEATURES, OHIST_FEATURES
 
 CAT_FEATS = ["actionId", "pointId", "handId", "strengthId", "spinId",
              "strikeId", "positionId", "sex"]
@@ -81,9 +81,11 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
         emb_dims += [16, 16]
         n_cat += 2
     # hist=True：每一拍附上「下一拍擊球者在本場先前 rally 的傾向」（HIST_FEATURES；hist_n 以 50 正規化，其餘是比率）
-    scalar_feats = SCALAR_FEATS + (HIST_FEATURES if hist else [])
-    scalar_div = (np.concatenate([SCALAR_DIV, np.array([50.0] + [1.0] * (len(HIST_FEATURES) - 1), np.float32)])
-                  if hist else SCALAR_DIV)
+    # hist="both"：再加上目前擊球者（對手）的同一組統計（OHIST_FEATURES）
+    hist_feats = (HIST_FEATURES + OHIST_FEATURES) if hist == "both" else (HIST_FEATURES if hist else [])
+    hist_div = [50.0] + [1.0] * (len(HIST_FEATURES) - 1)
+    scalar_feats = SCALAR_FEATS + hist_feats
+    scalar_div = np.concatenate([SCALAR_DIV, np.array(hist_div * (len(hist_feats) // len(HIST_FEATURES)), np.float32)])
     n_scal_base = len(scalar_feats)
     n_scal = n_scal_base + (config.N_ACTION if player_te else 0)
 
