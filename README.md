@@ -28,7 +28,8 @@ Kaggle 課堂競賽 [Introduction to Data Science Competition — TTMATCH](https
 | `gru_mirror`：左右鏡像資料增強 | [jabir95tsai](https://github.com/jabir95tsai/pingpong_aicup_2026)（第 22 名） | `ttmatch/methods/nn.py` |
 | 規則修正（情境中從未出現的預測改為眾數） | 同上 | `ttmatch/postprocess.py` |
 | `xgb`、`cat`：XGBoost / CatBoost 對照 | [lucas6028](https://github.com/lucas6028/AI_CUP_2026_Table_Tennis_Prediction)（前標） | `ttmatch/methods/trees.py` |
-| `lgbm_prog`、`cat_prog`：**比分推移特徵**（本 repo 新增，見下） | — | `ttmatch/features.py` |
+| `lgbm_prog`、`cat_prog`、`xgb_prog`：**比分推移特徵**（本 repo 新增，見下） | — | `ttmatch/features.py` |
+| `*_hist`、`*_hist2`：**同場先前資訊（history）特徵**（本 repo 新增，見下） | — | `ttmatch/history.py` |
 
 以上程式碼改寫自各隊公開 repo，每個檔案開頭都標註了出處；原作著作權屬原作者。
 
@@ -40,7 +41,13 @@ test 裡同一局會出現多個 rally，同局相鄰可見 rally 的 rally_id �
 
 兩個 rally 必須通過一致性檢查才會使用：同一對選手、`rally_id − 1 == 兩方比分和`、得分非負且相加等於間隔。test 的 match 340–354（262 個 rally）每場出現 21–31 位選手、rally_id 與比分不符，整場判定為異常，不提供比分推移資訊；arena 對這些 rally 的 winner 改用不含比分推移的集成。
 
-> ⚠️ 這個特徵是從 test 檔中其他 rally 的比分欄位推得勝負。它不用外部資料，但效果極大（winner AUC 約 0.67 → 0.83）。是否符合課堂競賽規則，請自行判斷；不想用時執行 `python arena.py --exclude lgbm_prog cat_prog --tag noprog`，會另外產生 `outputs/submission_noprog.csv`。
+> ⚠️ 這個特徵是從 test 檔中其他 rally 的比分欄位推得勝負。它不用外部資料，但效果極大（winner AUC 約 0.67 → 0.83）。是否符合課堂競賽規則，請自行判斷；不想用時執行 `python arena.py --preset noprog --tag noprog`，會另外產生 `outputs/submission_noprog.csv`。
+
+### 本 repo 新增：同場先前資訊（history）特徵
+
+train 與 test 的比賽不重疊，但 test 每場比賽平均可見 23 個 rally。「下一拍擊球者在這場比賽較早的 rally 裡怎麼打」（各球種、各落點的比例、攻擊率、平均力道，往全體分佈平滑）是選手 ID 之外合法可用的訊息：只用該 rally **之前**的 rally，不碰任何要預測的拍（`ttmatch/history.py`）。`*_hist2` 再加上目前擊球者（對手）的同一組統計。
+
+分佈對齊是關鍵。test 每局只看得到約 34% 的 rally，每個 rally 只看得到前綴 k 拍，而且第 k+1 拍一定存在（那是要預測的拍），所以看不到 rally 的最後一拍，長 rally 也更容易成為可見 rally。train 端先以 34% 機率保留 rally，再把 test 的前綴長度分佈「由長到短」配對到夠長的 rally 上，使 train 的可見前綴長度分佈與 test 幾乎相同（每個可見 rally 平均 3.07 拍，test 也是 3.07）。
 
 ## 使用方式
 
@@ -56,7 +63,8 @@ pip install -r requirements.txt  # torch 可改裝 CPU 版：pip install torch -
 python run_method.py --list                       # 列出所有方法
 python run_method.py lgbm xgb cat lgbm_prog       # 訓練方法，輸出 outputs/oof/<name>.npz
 python run_method.py gru transformer --device cpu # 序列模型（本機 CPU 可跑，較慢）
-python arena.py                                   # 比較、淘汰、集成 → outputs/arena_report.md、outputs/submission.csv
+python arena.py --preset final                    # 比較、淘汰、集成 → outputs/arena_report.md、outputs/submission.csv
+python eval_oof.py lgbm_note lgbm_hist            # 只比較幾個方法的單模分數（實驗用，比 arena 快很多）
 ```
 
 GPU 不夠時，用 [`notebooks/colab_train_nn.ipynb`](notebooks/colab_train_nn.ipynb) 在 Colab 訓練序列模型，再把 `outputs/oof/*.npz` 下載回本機。
@@ -67,53 +75,89 @@ GPU 不夠時，用 [`notebooks/colab_train_nn.ipynb`](notebooks/colab_train_nn.
 2. **長度對齊**：test 的前綴長度大多是 1–3 拍；評估時每個驗證 rally 依 test 的長度分佈抽一個前綴（重複 5 次）。
 3. **誠實的決策調參**：Macro-F1 決策規則在「另一半比賽」上調參、在這一半評估，兩半互換取平均。
 4. **優勝劣汰**：每個任務各自做貪婪前向選擇，從最佳單一方法開始，只有能讓誠實分數上升的方法才會加入，其餘淘汰。
+5. **巢狀估計**：集成成員、權重與決策規則全部只用「另一半比賽」挑選，再在這一半評分，兩半互換。這是沒有選擇偏差的估計，用來判斷一個改動是否真的有效（`arena.py` 的 `nested_estimate`）。
 
 ## 結果
 
-5-fold、依 match 分組、長度對齊、決策規則跨半調參（完整報告：執行 `python arena.py` 後見 `outputs/arena_report.md`）。序列模型在本機 CPU 只跑了 1 個 seed × 12 epoch；用 Colab notebook 跑更多 seed 應該還能再進步。
+5-fold、依 match 分組、長度對齊、決策規則跨半調參。重現：`python arena.py --preset final`（報告在 `outputs/arena_report.md`）。序列模型在本機 CPU 只跑了 1 個 seed × 12 epoch；用 Colab notebook 跑更多 seed 應該還能再進步。
 
-### 單一方法
+### 三種分數怎麼看
+
+| 分數 | 意義 |
+|---|---|
+| in-sample | 集成成員、權重、決策都在同一份 OOF 上挑，含選擇偏差，偏樂觀 |
+| **巢狀估計** | 成員、權重、決策只用「另一半比賽」挑選，在這一半評分，兩半互換；沒有選擇偏差，**用來決定採用哪個版本** |
+| **test 預期** | 再模擬 test 有 14.2% 的列（異常 match）拿不到比分推移、只能用 plain 集成 |
+
+### 最終集成（`--preset final`，22 個方法參與，優勝劣汰後留下 11 個，含異常 match 用的 plain 集成）
+
+| 任務 | 留下的方法（權重） | in-sample | 巢狀估計 |
+|---|---|---:|---:|
+| action | xgb_hist2 0.36、transformer_hist2 0.25、lgbm_note 0.18、lgbm_hist 0.11、gru_pemb_hist 0.10 | 0.4160 | 0.4127 |
+| point | xgb_hist2 0.38、lgbm_hist2 0.27、transformer_hist2 0.25、gru_pemb_hist 0.10 | 0.2127 | 0.2086 |
+| winner | xgb_prog 0.45、cat 0.45、transformer_hist 0.10 | 0.8458 | 0.8462 |
+| **overall** | | 0.4206 | **0.4177** |
+| **test 預期** | winner 約 0.8281（±0.0017） | | **約 0.4171** |
+| 不用比分推移（`--preset noprog`） | | <!-- NOPROG_IS --> | <!-- NOPROG_NESTED --> |
+
+分深度決策與規則修正（第 22 名）在 CV 上都沒有帶來穩定增益（< 0.0005），因此未採用。
+
+### 各版本比較（巢狀估計）
+
+| 版本 | overall 巢狀估計 | test 預期 |
+|---|---:|---:|
+| PR #3（第一輪方法） | 0.4063 | 0.4055 |
+| **+ 同場 history 特徵（目前採用）** | **0.4177** | **0.4171** |
+| + action/point 也用比分推移（`lgbm_hist_prog` 等 3 個） | 0.4157 | 0.4161 |
+
+最後一列的單一模型確實變強（`transformer_hist2_prog` 單模 overall 0.4100，是最佳單一模型），但多了候選方法後，貪婪選擇用快速調參分數挑中的成員在完整調參下反而較差（action 0.4122 vs 0.4160），巢狀估計下降，因此不採用。
+
+### 單一方法（節錄）
 
 | 方法 | action F1 | point F1 | winner AUC | overall |
 |---|---:|---:|---:|---:|
-| `transformer`（第 3 名） | **0.3834** | 0.1889 | 0.6787 | **0.3647** |
-| `lgbm_note`（第 3 名特徵，不加選手 TE） | 0.3687 | **0.1968** | 0.6652 | 0.3592 |
-| `cat`（lucas6028） | 0.3672 | 0.1864 | 0.6885 | 0.3591 |
+| `transformer_hist2`（+ 雙方 history） | 0.4030 | 0.2042 | 0.6712 | **0.3771** |
+| `transformer_hist`（+ history） | **0.4034** | 0.1971 | 0.6769 | 0.3756 |
+| `transformer`（第 3 名） | 0.3834 | 0.1889 | 0.6787 | 0.3647 |
+| `gru_hist` | 0.3907 | 0.1943 | 0.6514 | 0.3643 |
+| `lgbm_note`（第 3 名特徵，不加選手 TE） | 0.3687 | 0.1968 | 0.6652 | 0.3592 |
+| `cat`（lucas6028） | 0.3672 | 0.1864 | **0.6885** | 0.3591 |
 | `xgb`（lucas6028） | 0.3641 | 0.1889 | 0.6854 | 0.3583 |
-| `lgbm`（第 3 名原作法，選手 TE 已修正洩漏） | 0.3581 | 0.1968 | 0.6652 | 0.3550 |
-| `transformer_pemb` | 0.3661 | 0.1851 | 0.6632 | 0.3531 |
+| `gru_pemb_hist` | 0.3808 | 0.2041 | 0.6186 | 0.3577 |
 | `gru`（第 3 名） | 0.3699 | 0.1894 | 0.6463 | 0.3530 |
 | `gru_t2v_film`（第 5 名） | 0.3663 | 0.1876 | 0.6497 | 0.3515 |
-| `gru_pemb` | 0.3644 | 0.1938 | 0.6261 | 0.3485 |
 | `gru_mirror`（第 22 名） | 0.3543 | 0.1835 | 0.6452 | 0.3442 |
-| `lgbm_noplayer`（不用任何選手 ID） | 0.3116 | 0.1797 | — | — |
-| `cat_prog`（比分推移） | — | — | **0.8335** | — |
-| `lgbm_prog`（比分推移） | — | — | 0.8253 | — |
+| `xgb_hist2` / `xgb_hist` / `cat_hist` | 0.3883 / 0.3855 / 0.3865 | 0.2002 / 0.1986 / 0.1934 | — | — |
+| `lgbm_hist2` / `lgbm_hist` | 0.3726 / 0.3752 | 0.2005 / 0.1962 | — | — |
+| `xgb_prog` / `cat_prog` / `lgbm_prog`（比分推移） | — | — | 0.8346 / 0.8335 / 0.8253 | — |
 
-### 集成（優勝劣汰後留下的方法）
-
-| 任務 | 留下的方法（權重） | CV |
-|---|---|---:|
-| action | transformer 0.38、lgbm_note 0.26、gru_pemb 0.20、xgb 0.16 | 0.3971 |
-| point | lgbm 0.48、gru_mirror 0.32、gru_pemb 0.20 | 0.2023 |
-| winner | cat_prog 0.45、xgb 0.45、transformer 0.10 | 0.8462 |
-| **overall** | | **0.4090**（test 預期約 0.4055，見已知限制） |
-| overall（不用比分推移，`--exclude lgbm_prog cat_prog`） | winner 改為 cat / lgbm / xgb / transformer | 0.3790 |
-
-分深度決策與規則修正（第 22 名）在 CV 上都沒有帶來穩定增益（< 0.0005），因此未採用。集成分數含選擇偏差，會比單一方法排行榜略為樂觀。
+完整排行榜（含所有對照組）見 `outputs/arena_report.md`；`python eval_oof.py <方法…>` 可單獨比較幾個方法。
 
 ### 主要發現
 
-1. **選手身分是最重要的訊號之一**：拿掉選手 ID，action F1 從 0.369 掉到 0.312。但第 3 名的選手 target encoding 原寫法有標籤洩漏（訓練列的 TE 含自己的答案），修正成巢狀 OOF 後仍不如直接用原始選手 ID 類別特徵。
-2. **序列模型與樹模型互補**：Transformer 是最佳單一 action 模型，但集成後 action 從 0.383 提升到 0.397；point 則以 LightGBM 為主。
-3. **第 5 名的 Time2Vec + FiLM、第 22 名的鏡像增強**在這裡單獨的 overall 都沒有勝過基本 GRU（Time2Vec + FiLM 的 winner AUC 0.6497 略高於 GRU 的 0.6463，但 action 較低）；鏡像版 GRU 則在 point 集成中被選入（增加多樣性）。
-4. **比分推移特徵**讓 winner AUC 從 0.70 提升到 0.85，overall 約 +0.03。
+1. **同場先前資訊（history 特徵）是本輪最大的進步**：每個模型家族都受益——Transformer action +0.020、XGBoost action +0.024 / point +0.011、CatBoost action +0.019、GRU（選手嵌入版）point +0.010；集成的巢狀估計 +0.011。關鍵是 train 端的模擬：只用 test 實際可見的 rally 比例與前綴長度分佈，否則 train 的統計量會比 test 豐富得多（第一版沒模擬時，每列「先前可見拍數」train 平均 53.6、test 只有 18.4）。
+2. **選手身分是最重要的訊號之一**：拿掉選手 ID，action F1 從 0.369 掉到 0.312。第 3 名的選手 target encoding 原寫法有標籤洩漏，修正成巢狀 OOF 後仍不如直接用原始選手 ID。再加入「目前擊球者 ID」反而變差（action −0.006），第二個高基數選手特徵會過擬合。
+3. **左右鏡像增強（第 22 名）在這份資料無效**：套到樹模型 action −0.017、point −0.004，GRU 鏡像版也是最弱的 NN。大多數選手慣用右手，正手 / 反手兩側並不對稱。
+4. **seed bagging 與調整 LightGBM 大小 / 正則化都沒有穩定增益**（action −0.003～+0.002；較大模型的 point 反而 −0.006）。
+5. **比分推移特徵**讓 winner AUC 從 0.70 提升到 0.85，overall 約 +0.03。它也能幫 point（下一拍擊球者若是這個 rally 的輸家，有 39% 是失誤落點 0；若是勝方只有 0.7%），單一模型 point +0.003～+0.008，但集成層面沒有提升（見上表）。
+
+### 分數上限：為什麼離 0.5 還很遠
+
+要在 winner AUC 0.83 下達到 overall 0.5，action + point 的 Macro-F1 合計需 0.835，目前約 0.63。以目前集成在 OOF 上的表現：
+
+| | top-1 正確率 | top-3 正確率 | Macro-F1 |
+|---|---:|---:|---:|
+| action | 51% | 86% | 0.42 |
+| point | 31% | 64% | 0.22 |
+
+point 是瓶頸：落點 7 / 8 / 9 的 F1 都只有約 0.2；落點 1、3 合計只佔 1.2% 的資料卻佔 point Macro-F1 的 20%，F1 只有 0.13 / 0.05。這反映的是下一拍落點本身的隨機性，不是模型容量問題。原 AI CUP 第 3 名私榜 0.392（評分資料不同，不能直接比較）。再往上追 CV 分數，主要會是在擬合雜訊。
 
 ### 已知限制
 
 - Kaggle 公開榜尚未上傳驗證；評分公式沿用 AI CUP 原賽 0.4/0.4/0.2，未能在 Kaggle 頁面確認。
 - 樹模型與 NN 的 early stopping 用的是驗證 fold，OOF 分數會略為樂觀（各方法同樣受影響，排名比較仍公平）。
-- CV 無法衡量 test 端「同場比賽資訊」（ap_aug 的 test 內部轉移、test 選手 TE）帶來的好處，實際 test 表現可能與 CV 有落差。
+- CV 無法衡量 test 端「同場比賽資訊」（ap_aug 的 test 內部轉移）帶來的好處，實際 test 表現可能與 CV 有落差。
+- history 特徵的 train 模擬與 test 仍有小差異：test 的攻擊率略高（0.37 vs 0.34）、落點 9 比例略高（0.26 vs 0.23）。
 - 類別權重用整個 ap_base 計算（影響極小）。
-- test 的 match 340–354 資料異常（每場 21–31 位選手），這 262 個 rally 的 winner 只能靠擊球序列預測。
-- 因此上表 winner AUC 0.8462 / overall 0.4090 對 test 偏樂觀：test 有 14.2% 的列只能用不含比分推移的集成（CV AUC 0.6959），而 AUC 是整份 test 一起算。arena 在 CV 上隨機挑同比例的 match 改用該集成模擬，winner AUC 約 0.8285（±0.0016）、overall 約 **0.4055**，這才是較合理的 test 預期。
+- test 的 match 340–354 資料異常（每場 21–31 位選手），這 262 個 rally 拿不到比分推移資訊，winner 只能靠擊球序列與 history 預測；上表的「test 預期」已模擬這一點。
+- 巢狀估計只評一半比賽，雜訊比全量評估大；0.002 以內的差異不應視為顯著。

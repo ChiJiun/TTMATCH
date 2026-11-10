@@ -15,6 +15,7 @@
   python arena.py --fast                                  # 讀 *_fast.npz（冒煙測試）
   python arena.py --no-override                           # 不嘗試規則修正
   python arena.py --no-nested                             # 跳過巢狀估計
+  python arena.py --preset final                          # 只用 README 結果所用的方法集（FINAL_METHODS）
 """
 from __future__ import annotations
 import argparse
@@ -35,6 +36,17 @@ from ttmatch.metrics import macro_f1, winner_auc, overall_score
 from ttmatch.postprocess import fit_table, apply_override
 
 TASKS = {"a": ("next_action", config.ACTION_CLASSES), "p": ("next_point", config.POINT_CLASSES)}
+
+# README「結果」所用的方法集（改善回合 1 的結論）。依巢狀估計挑選：再加入 action/point 也用比分推移的
+# lgbm_hist_prog / xgb_hist2_prog / transformer_hist2_prog，巢狀估計反而從 0.4177 降到 0.4157，因此不納入。
+FINAL_METHODS = [
+    "cat", "cat_hist", "cat_prog", "cat_prog_bag3", "gru", "gru_hist", "gru_mirror", "gru_pemb", "gru_pemb_hist",
+    "gru_t2v_film", "lgbm_hist", "lgbm_hist2", "lgbm_note", "lgbm_prog", "transformer", "transformer_hist",
+    "transformer_hist2", "transformer_pemb", "xgb", "xgb_hist", "xgb_hist2", "xgb_prog",
+]
+# 不含比分推移特徵的版本（課堂規則若不允許比分推移時使用）
+NOPROG_METHODS = [m for m in FINAL_METHODS if not m.endswith("_prog") and m != "cat_prog_bag3"]
+PRESETS = {"final": FINAL_METHODS, "noprog": NOPROG_METHODS}
 BLEND_GRID = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
 MIN_GAIN = 5e-4
 
@@ -217,6 +229,7 @@ def main():
     ap.add_argument("--exclude", nargs="*", default=[], help="不納入比較的方法名稱，例如 lgbm_prog cat_prog")
     ap.add_argument("--tag", default="", help="輸出檔名後綴，例如 noprog → submission_noprog.csv")
     ap.add_argument("--no-nested", action="store_true", help="跳過巢狀估計（省時間）")
+    ap.add_argument("--preset", choices=sorted(PRESETS), help="只用預先定義的方法集（final / noprog）")
     args = ap.parse_args()
 
     D = build_datasets()
@@ -228,6 +241,11 @@ def main():
     if unknown:
         print(f"警告：--exclude 中的 {', '.join(unknown)} 不在 outputs/oof/ 裡，已忽略", flush=True)
     methods = {n: z for n, z in methods.items() if n not in set(args.exclude)}
+    if args.preset:
+        missing = sorted(set(PRESETS[args.preset]) - methods.keys())
+        if missing:
+            raise SystemExit(f"--preset {args.preset} 需要的方法還沒訓練：{', '.join(missing)}（請先執行 run_method.py）")
+        methods = {n: methods[n] for n in PRESETS[args.preset]}
     if not methods:
         raise SystemExit("--exclude 排除了所有方法，沒有剩下可比較的方法")
     ev = Evaluator(D)
