@@ -24,10 +24,16 @@ def argmax_decision(n_classes: int):
     return (1.0, np.zeros(n_classes))
 
 
+def _pred(logp, classes, alpha, logw):
+    return classes[(alpha * logp + logw[None, :]).argmax(axis=1)]
+
+
 def tune_decision(probs, y_true, classes, n_coord_passes: int = 2, alpha_grid=ALPHA_GRID):
+    """結果與逐次呼叫 apply_decision 的版本完全相同，只是 log 機率只算一次（arena 會呼叫上萬次）。"""
     classes = np.asarray(classes)
     y_true = np.asarray(y_true)
     C = len(classes)
+    logp = np.log(np.clip(probs, 1e-12, None))
     freq = np.clip(np.array([(y_true == c).mean() for c in classes]), 1e-6, None)
     log_freq = np.log(freq)
 
@@ -35,7 +41,7 @@ def tune_decision(probs, y_true, classes, n_coord_passes: int = 2, alpha_grid=AL
     for a in alpha_grid:
         for beta in np.linspace(0.0, 1.2, 13):
             lw = -beta * log_freq
-            f = macro_f1(y_true, apply_decision(probs, classes, (a, lw)))
+            f = macro_f1(y_true, _pred(logp, classes, a, lw))
             if f > best_f:
                 best_f, alpha, logw = f, a, lw.copy()
 
@@ -45,14 +51,14 @@ def tune_decision(probs, y_true, classes, n_coord_passes: int = 2, alpha_grid=AL
             local_f, local_w = best_f, base
             for d in _W_GRID:
                 logw[ci] = base + d
-                f = macro_f1(y_true, apply_decision(probs, classes, (alpha, logw)))
+                f = macro_f1(y_true, _pred(logp, classes, alpha, logw))
                 if f > local_f:
                     local_f, local_w = f, logw[ci]
             logw[ci] = local_w
             best_f = local_f
 
     for a in alpha_grid:
-        f = macro_f1(y_true, apply_decision(probs, classes, (a, logw)))
+        f = macro_f1(y_true, _pred(logp, classes, a, logw))
         if f > best_f:
             best_f, alpha = f, a
     return (alpha, logw), best_f
