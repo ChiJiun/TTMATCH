@@ -98,7 +98,7 @@ GPU 不夠時，用 [`notebooks/colab_train_nn.ipynb`](notebooks/colab_train_nn.
 | winner | xgb_prog 0.45、cat 0.45、transformer_hist 0.10 | 0.8458 | 0.8462 |
 | **overall** | | 0.4206 | **0.4177** |
 | **test 預期** | winner 約 0.8281（±0.0017） | | **約 0.4171** |
-| 不用比分推移（`--preset noprog`） | | <!-- NOPROG_IS --> | <!-- NOPROG_NESTED --> |
+| 不用比分推移（`--preset noprog`，winner 0.6959） | | 0.3907 | 0.3874 |
 
 分深度決策與規則修正（第 22 名）在 CV 上都沒有帶來穩定增益（< 0.0005），因此未採用。
 
