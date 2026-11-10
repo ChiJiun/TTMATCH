@@ -14,6 +14,7 @@ import numpy as np
 
 from ttmatch import config
 from ttmatch.data import build_datasets
+from ttmatch.history import HIST_FEATURES
 
 
 def _trees(kind, **kw):
@@ -62,6 +63,20 @@ METHODS = {
     "xgb_prog": ("XGBoost winner + 比分推移特徵", _trees("xgb", targets=("w",), use_prog=True)),
     "lgbm_prog_bag3": ("LightGBM winner + 比分推移，3 seed", _trees("lgbm", targets=("w",), use_prog=True, n_seeds=3)),
     "cat_prog_bag3": ("CatBoost winner + 比分推移，3 seed", _trees("cat", targets=("w",), use_prog=True, n_seeds=3)),
+    "lgbm_pair": ("LightGBM action/point + 目前擊球者 ID（對戰組合資訊）",
+                  _trees("lgbm", targets=("a", "p"), player_te=False, extra=("cur_player",))),
+    "lgbm_hist": ("LightGBM action/point + 同場先前 rally 的選手傾向（history 特徵）",
+                  _trees("lgbm", targets=("a", "p"), player_te=False, extra=tuple(HIST_FEATURES))),
+    "lgbm_pair_hist": ("LightGBM action/point + 目前擊球者 ID + history 特徵",
+                       _trees("lgbm", targets=("a", "p"), player_te=False,
+                              extra=("cur_player",) + tuple(HIST_FEATURES))),
+    "lgbm_hist_w": ("LightGBM winner + 比分推移 + history 特徵",
+                    _trees("lgbm", targets=("w",), use_prog=True, extra=tuple(HIST_FEATURES))),
+    "xgb_hist": ("XGBoost action/point + history 特徵",
+                 _trees("xgb", targets=("a", "p"), player_te=False, extra=tuple(HIST_FEATURES))),
+    "transformer_hist": ("因果 Transformer + history 特徵（每拍附下一拍擊球者的同場傾向）",
+                         _nn("transformer", hist=True)),
+    "gru_pemb_hist": ("GRU + 選手 ID 嵌入 + history 特徵", _nn("gru", player_emb=True, player_te=False, hist=True)),
     "gru": ("因果 GRU 多任務序列模型（第 3 名 0000workjason）", _nn("gru")),
     "transformer": ("因果 Transformer 多任務序列模型（第 3 名 0000workjason）", _nn("transformer")),
     "gru_t2v_film": ("GRU + Time2Vec + FiLM（第 5 名 SugarSquirrel v8）", _nn("t2v_film")),

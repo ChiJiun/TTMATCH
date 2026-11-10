@@ -37,6 +37,8 @@ NUMERIC = [
     "prev_is_attack", "recent_attack2",
 ]
 FEATURES = CATEGORICAL + NUMERIC
+# 可選的類別特徵（預設不在 FEATURES 裡，由方法的 extra 參數加入）：目前擊球者 ID（與 next_player 構成對戰組合）
+CATEGORICAL_OPTIONAL = ["cur_player"]
 
 # 比分推移特徵：同一局下一個「可見」rally 的比分，揭露本 rally 誰得分
 PROG_FEATURES = ["prog_has_next", "prog_gap", "prog_srv_gain", "prog_rcv_gain", "prog_frac"]
@@ -67,6 +69,7 @@ def add_features(df: pd.DataFrame, has_winner: bool = True) -> pd.DataFrame:
     df["is_predict_receive"] = (t == 1).astype(int)
     df["is_predict_third"] = (t == 2).astype(int)
     df["next_player"] = df["gamePlayerOtherId"].astype(int)
+    df["cur_player"] = df["gamePlayerId"].astype(int)
 
     df["last_action"] = df["actionId"].astype(int)
     df["last_point"] = df["pointId"].astype(int)

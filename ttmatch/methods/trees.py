@@ -11,7 +11,7 @@ import pandas as pd
 
 from .. import config
 from ..cv import get_folds
-from ..features import (CATEGORICAL, PROG_FEATURES, get_X,
+from ..features import (CATEGORICAL, CATEGORICAL_OPTIONAL, PROG_FEATURES, get_X,
                         fit_target_encoding, apply_target_encoding, oof_target_encoding)
 
 ACTION_TE_KEYS = [["next_player"], ["next_player", "last_action"], ["next_player", "next_strikeId"]]
@@ -57,7 +57,7 @@ def _fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast,
             params.update(objective="multiclass", num_class=n_class, metric="multi_logloss")
         else:
             params.update(objective="binary", metric="auc")
-        cats = [c for c in CATEGORICAL if c in X_tr.columns]
+        cats = [c for c in CATEGORICAL + CATEGORICAL_OPTIONAL if c in X_tr.columns]
         dtr = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, categorical_feature=cats, free_raw_data=False)
         dva = lgb.Dataset(X_va, label=y_va, categorical_feature=cats, reference=dtr)
         m = lgb.train(params, dtr, num_boost_round=rounds, valid_sets=[dva],
@@ -83,7 +83,7 @@ def _fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast,
 
     if kind == "cat":
         from catboost import CatBoostClassifier
-        cats = [c for c in CATEGORICAL if c in X_tr.columns]
+        cats = [c for c in CATEGORICAL + CATEGORICAL_OPTIONAL if c in X_tr.columns]
         # 多類別 + 大量類別特徵時 CTR 計算很慢：限制 CTR 組合、小詞彙類別改 one-hot
         cat_params = dict(
             iterations=150 if fast else 700, learning_rate=0.12, depth=6,
@@ -103,13 +103,15 @@ def _fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast,
 
 def train_multiclass(kind, D, target_col, classes, n_folds=config.N_FOLDS, fast=False,
                      te_keys=None, te_alpha=1.0, aug_weight_mult=5.0, use_aug=True, drop=(),
-                     mirror=False, mirror_weight=1.0, n_seeds=1, params=None):
+                     mirror=False, mirror_weight=1.0, n_seeds=1, params=None, extra=()):
     """回傳 (oof, test_pred)，欄位順序 = classes。
 
-    drop：要拿掉的特徵欄。mirror：把訓練 fold 的左右鏡像列也加進訓練（標籤為 next_point 時一併鏡像），
-    驗證 / test 永遠用原始列。n_seeds：seed bagging。params：覆寫套件參數。
+    drop：要拿掉的特徵欄。extra：額外加入的特徵欄（例如 cur_player、HIST_FEATURES）。
+    mirror：把訓練 fold 的左右鏡像列也加進訓練（標籤為 next_point 時一併鏡像），驗證 / test 永遠用原始列；
+    鏡像表沒有 extra 欄位，不能與 extra 同時使用。n_seeds：seed bagging。params：覆寫套件參數。
     """
-    _X = lambda df: get_X(df).drop(columns=list(drop))
+    assert not (mirror and extra), "mirror 與 extra 不能同時使用"
+    _X = lambda df: get_X(df, list(extra)).drop(columns=list(drop))
     base_df, test_df = D["ap_base"], D["test_pred"]
     aug_df = D["ap_aug"] if use_aug else None
     mir_df = D["ap_base_mirror"] if mirror else None
@@ -156,9 +158,10 @@ def train_multiclass(kind, D, target_col, classes, n_folds=config.N_FOLDS, fast=
     return oof, test_pred
 
 
-def train_winner(kind, D, n_folds=config.N_FOLDS, fast=False, use_prog=False, n_seeds=1, params=None):
+def train_winner(kind, D, n_folds=config.N_FOLDS, fast=False, use_prog=False, n_seeds=1, params=None,
+                 extra=()):
     base_df, test_df = D["ap_base"], D["test_pred"]
-    extra = PROG_FEATURES if use_prog else None
+    extra = (PROG_FEATURES if use_prog else []) + list(extra)
     yb = base_df["winner"].astype(int).to_numpy()
     oof = np.zeros(len(base_df))
     test_pred = np.zeros(len(test_df))
@@ -174,9 +177,10 @@ def train_winner(kind, D, n_folds=config.N_FOLDS, fast=False, use_prog=False, n_
 
 def run(kind, D, n_folds=config.N_FOLDS, fast=False, player_te=True, targets=("a", "p", "w"),
         use_prog=False, te_alpha=1.0, drop=(), mirror=False, mirror_weight=1.0, n_seeds=1,
-        params=None):
+        params=None, extra=()):
     out = {}
-    common = dict(drop=drop, mirror=mirror, mirror_weight=mirror_weight, n_seeds=n_seeds, params=params)
+    common = dict(drop=drop, mirror=mirror, mirror_weight=mirror_weight, n_seeds=n_seeds, params=params,
+                  extra=extra)
     if "a" in targets:
         out["oof_a"], out["te_a"] = train_multiclass(
             kind, D, "next_action", config.ACTION_CLASSES, n_folds, fast,
@@ -187,5 +191,5 @@ def run(kind, D, n_folds=config.N_FOLDS, fast=False, player_te=True, targets=("a
             kind, D, "next_point", config.POINT_CLASSES, n_folds, fast, **common)
     if "w" in targets:
         out["oof_w"], out["te_w"] = train_winner(kind, D, n_folds, fast, use_prog,
-                                                 n_seeds=n_seeds, params=params)
+                                                 n_seeds=n_seeds, params=params, extra=extra)
     return out

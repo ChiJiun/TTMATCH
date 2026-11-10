@@ -12,6 +12,7 @@ import pandas as pd
 from . import config
 from .features import (add_features, test_gap_distribution, inconsistent_matches,
                        score_progression_train, score_progression_test, mirror_raw)
+from .history import match_history, attach_history, test_visible_rally_frac
 
 
 def load_raw():
@@ -35,6 +36,10 @@ def build_datasets(use_test_aug: bool = True) -> dict:
     gap_dist = test_gap_distribution(te)
     trf = trf.merge(score_progression_train(tr, gap_dist), on="rally_uid", how="left")
     tef = tef.merge(score_progression_test(te), on="rally_uid", how="left")
+
+    # 同場先前 rally 的選手傾向；train 依 test 的可見 rally 比例與前綴長度分佔模擬
+    trf = attach_history(trf, match_history(tr, test_length_probs(tef), test_visible_rally_frac(te)))
+    tef = attach_history(tef, match_history(te))
 
     ap_base = _strip_serve_targets(trf)
     ap_base["winner"] = ap_base["winner"].astype(int)

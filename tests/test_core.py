@@ -167,3 +167,36 @@ def test_nested_estimate_returns_scores():
     w = {"m1": rng.random(n), "m2": rng.random(n)}
     b, s = nested_estimate(ev, list(w), w, "w")
     assert 0.0 <= b <= 1.0 and 0.0 <= s <= 1.0
+
+
+def test_match_history_uses_only_earlier_rallies():
+    from ttmatch.history import match_history, HIST_PRIOR
+    rows = []
+    # 一場比賽、一局、三個 rally：選手 1 在 rally 1 打 2 拍攻擊（action 1）、rally 2 打 1 拍控制（action 10）
+    for rid, strokes in {1: [(1, 1, 1), (2, 2, 8), (3, 1, 1)], 2: [(1, 1, 10), (2, 2, 8)], 3: [(1, 2, 8)]}.items():
+        for sn, player, action in strokes:
+            rows.append(dict(rally_uid=rid, match=1, numberGame=1, rally_id=rid, strikeNumber=sn,
+                             gamePlayerId=player, gamePlayerOtherId=3 - player, actionId=action,
+                             pointId=5, strengthId=2))
+    df = pd.DataFrame(rows)
+    h = match_history(df).set_index(["match", "numberGame", "rally_id", "next_player"])
+    assert h.loc[(1, 1, 1, 1), "hist_n"] == 0 and h.loc[(1, 1, 1, 2), "hist_n"] == 0
+    assert h.loc[(1, 1, 2, 1), "hist_n"] == 2 and h.loc[(1, 1, 3, 1), "hist_n"] == 3
+    # rally 3 之前，選手 1 的 3 拍有 2 拍攻擊；全體攻擊率 2/6
+    g_att = 2 / 6
+    assert abs(h.loc[(1, 1, 3, 1), "hist_attack_rate"] - (2 + HIST_PRIOR * g_att) / (3 + HIST_PRIOR)) < 1e-12
+    # 選手 2 在 rally 3 本身的拍不能算進 rally 3 的歷史
+    assert h.loc[(1, 1, 3, 2), "hist_n"] == 2
+    # 截斷模擬：只看第 1 拍 → 選手 1 在 rally 3 之前只剩 2 拍（rally 1、2 的第 1 拍）
+    h1 = match_history(df, {1: 1.0}).set_index(["match", "numberGame", "rally_id", "next_player"])
+    assert h1.loc[(1, 1, 3, 1), "hist_n"] == 2 and h1.loc[(1, 1, 3, 2), "hist_n"] == 0
+    # 全部 k=2：只有 rally 1（3 拍）配得到 k=2；rally 2（2 拍）配不到 → k = 長度 − 1 = 1
+    h2 = match_history(df, {2: 1.0}).set_index(["match", "numberGame", "rally_id", "next_player"])
+    assert h2.loc[(1, 1, 3, 1), "hist_n"] == 2 and h2.loc[(1, 1, 3, 2), "hist_n"] == 1
+    # 全部 k=10：沒有 rally 配得到 → 都退回 k = 長度 − 1，永遠看不到最後一拍
+    h10 = match_history(df, {10: 1.0}).set_index(["match", "numberGame", "rally_id", "next_player"])
+    assert h10.loc[(1, 1, 3, 1), "hist_n"] == 2 and h10.loc[(1, 1, 3, 2), "hist_n"] == 1
+    assert (h10["hist_pt0"] < 0.5).all()  # 沒有任何 pointId 0 的最後一拍被算進去（此例全是 pointId 5）
+    # keep_prob=0 → 沒有任何 rally 可見
+    h3 = match_history(df, None, 0.0).set_index(["match", "numberGame", "rally_id", "next_player"])
+    assert (h3["hist_n"] == 0).all()
