@@ -15,7 +15,7 @@ import pandas as pd
 
 from .. import config
 from ..cv import get_folds
-from ..features import fit_target_encoding, POINT_MIRROR, POSITION_MIRROR  # noqa: F401（測試從此匯入）
+from ..features import fit_target_encoding, POINT_MIRROR, POSITION_MIRROR, PROG_FEATURES  # noqa: F401
 from ..history import HIST_FEATURES, OHIST_FEATURES
 
 CAT_FEATS = ["actionId", "pointId", "handId", "strengthId", "spinId",
@@ -33,7 +33,7 @@ def _build_records(df: pd.DataFrame, scalar_feats=SCALAR_FEATS, scalar_div=SCALA
         recs.append(dict(
             uid=int(uid), match=sub["match"].iloc[0],
             cats=sub[CAT_FEATS].to_numpy(dtype=np.int64),
-            scal=(sub[scalar_feats].to_numpy(dtype=np.float32) / scalar_div),
+            scal=np.nan_to_num(sub[scalar_feats].to_numpy(dtype=np.float32) / scalar_div),  # prog 特徵可為 NaN
             pos=np.clip(sub["strikeNumber"].to_numpy(dtype=np.int64), 0, POS_CAP),
             action=sub["actionId"].to_numpy(dtype=np.int64),
             point=sub["pointId"].to_numpy(dtype=np.int64),
@@ -58,7 +58,7 @@ def _mirror(rec):
 def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=16,
              fast=False, hidden=160, layers=2, dropout=0.3, lr=2e-3, weight_decay=1e-5,
              batch_size=128, n_seeds=2, seed=config.SEED, player_te=True, mirror=False,
-             player_emb=False, player_drop=0.15, hist=False):
+             player_emb=False, player_drop=0.15, hist=False, prog=False):
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader
@@ -84,8 +84,12 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
     # hist="both"：再加上目前擊球者（對手）的同一組統計（OHIST_FEATURES）
     hist_feats = (HIST_FEATURES + OHIST_FEATURES) if hist == "both" else (HIST_FEATURES if hist else [])
     hist_div = [50.0] + [1.0] * (len(HIST_FEATURES) - 1)
-    scalar_feats = SCALAR_FEATS + hist_feats
-    scalar_div = np.concatenate([SCALAR_DIV, np.array(hist_div * (len(hist_feats) // len(HIST_FEATURES)), np.float32)])
+    # prog=True：再加上比分推移特徵（揭露 rally 勝方；gap 與得分以 10 正規化，NaN 補 0）
+    prog_feats = PROG_FEATURES if prog else []
+    prog_div = {"prog_has_next": 1.0, "prog_gap": 10.0, "prog_srv_gain": 10.0, "prog_rcv_gain": 10.0, "prog_frac": 1.0}
+    scalar_feats = SCALAR_FEATS + hist_feats + prog_feats
+    scalar_div = np.concatenate([SCALAR_DIV, np.array(hist_div * (len(hist_feats) // len(HIST_FEATURES)), np.float32),
+                                 np.array([prog_div[c] for c in prog_feats], np.float32)])
     n_scal_base = len(scalar_feats)
     n_scal = n_scal_base + (config.N_ACTION if player_te else 0)
 

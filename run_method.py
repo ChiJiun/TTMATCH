@@ -32,7 +32,7 @@ def _nn(arch, **kw):
         from ttmatch.methods.nn import train_nn
         return train_nn(D, arch=arch, n_folds=a.folds, device=a.device, fast=a.fast,
                         epochs=a.epochs, n_seeds=a.seeds, **kw)
-    f.uses_prog = False
+    f.uses_prog = bool(kw.get("prog", False))
     return f
 
 
@@ -90,6 +90,8 @@ METHODS = {
     "xgb_hist2_prog": ("XGBoost action/point + 雙方 history + 比分推移特徵",
                        _trees("xgb", targets=("a", "p"), player_te=False,
                               extra=tuple(HIST_FEATURES + OHIST_FEATURES + PROG_FEATURES))),
+    "transformer_hist2_prog": ("因果 Transformer + 雙方 history + 比分推移特徵（三任務都用）",
+                               _nn("transformer", hist="both", prog=True)),
     "lgbm_hist_prog": ("LightGBM action/point + history + 比分推移特徵",
                        _trees("lgbm", targets=("a", "p"), player_te=False,
                               extra=tuple(HIST_FEATURES + PROG_FEATURES))),
