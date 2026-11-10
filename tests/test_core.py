@@ -116,3 +116,98 @@ def test_mixed_auc_interpolates_between_blends():
     assert abs(m1 - lo) < 1e-12
     assert abs(m0 - hi) < 1e-12
     assert lo < m < hi and s > 0
+
+
+def _fake_D(n_matches=8, rallies_per_match=30, seed=0):
+    rng = np.random.default_rng(seed)
+    rows, uid = [], 0
+    for m in range(n_matches):
+        for _ in range(rallies_per_match):
+            for t in range(1, int(rng.integers(1, 5)) + 1):
+                rows.append(dict(rally_uid=uid, match=m, prefix_len=t, next_action=int(rng.integers(0, 15)),
+                                 next_point=int(rng.integers(0, 10)), winner=int(rng.integers(0, 2))))
+            uid += 1
+    tef = pd.DataFrame(dict(rally_uid=np.repeat(np.arange(50), 2), strikeNumber=np.tile([1, 2], 50)))
+    return dict(ap_base=pd.DataFrame(rows), tef=tef)
+
+
+def test_evaluator_halves_and_restricted():
+    from arena import Evaluator
+    D = _fake_D()
+    ev = Evaluator(D, repeats=2)
+    rng = np.random.default_rng(1)
+    p = rng.dirichlet(np.ones(15), len(D["ap_base"]))
+    full = ev.f1(p, "a")
+    assert abs(full - np.mean([ev.f1(p, "a", halves=(0,)), ev.f1(p, "a", halves=(1,))])) < 1e-12
+    # auc(halves=(h,)) 只用第 h 半的列
+    w = rng.random(len(D["ap_base"]))
+    s = ev.sel[0]
+    from sklearn.metrics import roc_auc_score
+    manual = np.mean([roc_auc_score(ev.y["w"][s[ev.half[s] == 0]], w[s[ev.half[s] == 0]]) for s in ev.sel])
+    assert abs(ev.auc(w, halves=(0,)) - manual) < 1e-12
+    # restricted：抽樣列全在 mask 內，且兩半都有列、沿 match 切
+    mask = ev.half != 1
+    sub = ev.restricted(mask)
+    assert all(mask[s].all() for s in sub.sel)
+    rows = np.where(mask)[0]
+    assert set(sub.half[rows]) == {0, 1}
+    m = D["ap_base"]["match"].to_numpy()
+    assert not (set(m[rows][sub.half[rows] == 0]) & set(m[rows][sub.half[rows] == 1]))
+
+
+def test_nested_estimate_returns_scores():
+    from arena import Evaluator, nested_estimate
+    D = _fake_D()
+    ev = Evaluator(D, repeats=2)
+    rng = np.random.default_rng(2)
+    n = len(D["ap_base"])
+    oof = {"m1": rng.dirichlet(np.ones(10), n), "m2": rng.dirichlet(np.ones(10), n)}
+    b, s = nested_estimate(ev, list(oof), oof, "p")
+    assert 0.0 <= b <= 1.0 and 0.0 <= s <= 1.0
+    w = {"m1": rng.random(n), "m2": rng.random(n)}
+    b, s = nested_estimate(ev, list(w), w, "w")
+    assert 0.0 <= b <= 1.0 and 0.0 <= s <= 1.0
+
+
+def test_match_history_uses_only_earlier_rallies():
+    from ttmatch.history import match_history, HIST_PRIOR
+    rows = []
+    # 一場比賽、一局、三個 rally：選手 1 在 rally 1 打 2 拍攻擊（action 1）、rally 2 打 1 拍控制（action 10）
+    for rid, strokes in {1: [(1, 1, 1), (2, 2, 8), (3, 1, 1)], 2: [(1, 1, 10), (2, 2, 8)], 3: [(1, 2, 8)]}.items():
+        for sn, player, action in strokes:
+            rows.append(dict(rally_uid=rid, match=1, numberGame=1, rally_id=rid, strikeNumber=sn,
+                             gamePlayerId=player, gamePlayerOtherId=3 - player, actionId=action,
+                             pointId=5, strengthId=2))
+    df = pd.DataFrame(rows)
+    h = match_history(df).set_index(["match", "numberGame", "rally_id", "next_player"])
+    assert h.loc[(1, 1, 1, 1), "hist_n"] == 0 and h.loc[(1, 1, 1, 2), "hist_n"] == 0
+    assert h.loc[(1, 1, 2, 1), "hist_n"] == 2 and h.loc[(1, 1, 3, 1), "hist_n"] == 3
+    # rally 3 之前，選手 1 的 3 拍有 2 拍攻擊；全體攻擊率 2/6
+    g_att = 2 / 6
+    assert abs(h.loc[(1, 1, 3, 1), "hist_attack_rate"] - (2 + HIST_PRIOR * g_att) / (3 + HIST_PRIOR)) < 1e-12
+    # 選手 2 在 rally 3 本身的拍不能算進 rally 3 的歷史
+    assert h.loc[(1, 1, 3, 2), "hist_n"] == 2
+    # 截斷模擬：只看第 1 拍 → 選手 1 在 rally 3 之前只剩 2 拍（rally 1、2 的第 1 拍）
+    h1 = match_history(df, {1: 1.0}).set_index(["match", "numberGame", "rally_id", "next_player"])
+    assert h1.loc[(1, 1, 3, 1), "hist_n"] == 2 and h1.loc[(1, 1, 3, 2), "hist_n"] == 0
+    # 全部 k=2：只有 rally 1（3 拍）配得到 k=2；rally 2（2 拍）配不到 → k = 長度 − 1 = 1
+    h2 = match_history(df, {2: 1.0}).set_index(["match", "numberGame", "rally_id", "next_player"])
+    assert h2.loc[(1, 1, 3, 1), "hist_n"] == 2 and h2.loc[(1, 1, 3, 2), "hist_n"] == 1
+    # 全部 k=10：沒有 rally 配得到 → 都退回 k = 長度 − 1，永遠看不到最後一拍
+    h10 = match_history(df, {10: 1.0}).set_index(["match", "numberGame", "rally_id", "next_player"])
+    assert h10.loc[(1, 1, 3, 1), "hist_n"] == 2 and h10.loc[(1, 1, 3, 2), "hist_n"] == 1
+    assert (h10["hist_pt0"] < 0.5).all()  # 沒有任何 pointId 0 的最後一拍被算進去（此例全是 pointId 5）
+    # keep_prob=0 → 沒有任何 rally 可見
+    h3 = match_history(df, None, 0.0).set_index(["match", "numberGame", "rally_id", "next_player"])
+    assert (h3["hist_n"] == 0).all()
+
+
+def test_mixed_score_two_dimensional():
+    from arena import mixed_score
+    rng = np.random.default_rng(3)
+    groups = np.repeat(np.arange(20), 10)
+    main, plain = np.zeros((200, 3)), np.ones((200, 3))
+    seen = []
+    m, s = mixed_score(lambda p: seen.append(p) or float(p[:, 0].mean()), groups, main, plain, 0.25, repeats=3)
+    assert abs(m - 0.25) < 1e-12 and s == 0.0          # 每次剛好 5 / 20 場 match 換成 plain
+    assert all(((p == 0) | (p == 1)).all() and (p.min(1) == p.max(1)).all() for p in seen)  # 整列一起換

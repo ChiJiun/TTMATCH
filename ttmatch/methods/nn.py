@@ -15,7 +15,8 @@ import pandas as pd
 
 from .. import config
 from ..cv import get_folds
-from ..features import fit_target_encoding
+from ..features import fit_target_encoding, POINT_MIRROR, POSITION_MIRROR, PROG_FEATURES  # noqa: F401
+from ..history import HIST_FEATURES, OHIST_FEATURES
 
 CAT_FEATS = ["actionId", "pointId", "handId", "strengthId", "spinId",
              "strikeId", "positionId", "sex"]
@@ -24,11 +25,7 @@ SCALAR_FEATS = ["score_diff", "total_points", "striker_is_server",
 SCALAR_DIV = np.array([11.0, 22.0, 1.0, 1.0, 1.0, 10.0], dtype=np.float32)
 POS_CAP = 40
 
-POINT_MIRROR = np.array([0, 3, 2, 1, 6, 5, 4, 9, 8, 7])
-POSITION_MIRROR = np.array([0, 3, 2, 1])
-
-
-def _build_records(df: pd.DataFrame):
+def _build_records(df: pd.DataFrame, scalar_feats=SCALAR_FEATS, scalar_div=SCALAR_DIV):
     df = df.sort_values(["rally_uid", "strikeNumber"])
     recs = []
     for uid, sub in df.groupby("rally_uid", sort=False):
@@ -36,7 +33,7 @@ def _build_records(df: pd.DataFrame):
         recs.append(dict(
             uid=int(uid), match=sub["match"].iloc[0],
             cats=sub[CAT_FEATS].to_numpy(dtype=np.int64),
-            scal=(sub[SCALAR_FEATS].to_numpy(dtype=np.float32) / SCALAR_DIV),
+            scal=np.nan_to_num(sub[scalar_feats].to_numpy(dtype=np.float32) / scalar_div),  # prog 特徵可為 NaN
             pos=np.clip(sub["strikeNumber"].to_numpy(dtype=np.int64), 0, POS_CAP),
             action=sub["actionId"].to_numpy(dtype=np.int64),
             point=sub["pointId"].to_numpy(dtype=np.int64),
@@ -61,7 +58,7 @@ def _mirror(rec):
 def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=16,
              fast=False, hidden=160, layers=2, dropout=0.3, lr=2e-3, weight_decay=1e-5,
              batch_size=128, n_seeds=2, seed=config.SEED, player_te=True, mirror=False,
-             player_emb=False, player_drop=0.15):
+             player_emb=False, player_drop=0.15, hist=False, prog=False):
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader
@@ -83,11 +80,21 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
         vocabs += [n_players, n_players]
         emb_dims += [16, 16]
         n_cat += 2
-    n_scal_base = len(SCALAR_FEATS)
+    # hist=True：每一拍附上「下一拍擊球者在本場先前 rally 的傾向」（HIST_FEATURES；hist_n 以 50 正規化，其餘是比率）
+    # hist="both"：再加上目前擊球者（對手）的同一組統計（OHIST_FEATURES）
+    hist_feats = (HIST_FEATURES + OHIST_FEATURES) if hist == "both" else (HIST_FEATURES if hist else [])
+    hist_div = [50.0] + [1.0] * (len(HIST_FEATURES) - 1)
+    # prog=True：再加上比分推移特徵（揭露 rally 勝方；gap 與得分以 10 正規化，NaN 補 0）
+    prog_feats = PROG_FEATURES if prog else []
+    prog_div = {"prog_has_next": 1.0, "prog_gap": 10.0, "prog_srv_gain": 10.0, "prog_rcv_gain": 10.0, "prog_frac": 1.0}
+    scalar_feats = SCALAR_FEATS + hist_feats + prog_feats
+    scalar_div = np.concatenate([SCALAR_DIV, np.array(hist_div * (len(hist_feats) // len(HIST_FEATURES)), np.float32),
+                                 np.array([prog_div[c] for c in prog_feats], np.float32)])
+    n_scal_base = len(scalar_feats)
     n_scal = n_scal_base + (config.N_ACTION if player_te else 0)
 
-    train_recs = _build_records(trf)
-    test_recs = _build_records(tef)
+    train_recs = _build_records(trf, scalar_feats, scalar_div)
+    test_recs = _build_records(tef, scalar_feats, scalar_div)
     train_match = np.array([r["match"] for r in train_recs])
 
     def _cls_w(y, n, temper=0.5):

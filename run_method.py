@@ -14,13 +14,16 @@ import numpy as np
 
 from ttmatch import config
 from ttmatch.data import build_datasets
+from ttmatch.features import PROG_FEATURES
+from ttmatch.history import HIST_FEATURES, OHIST_FEATURES
 
 
 def _trees(kind, **kw):
     def f(D, a):
         from ttmatch.methods.trees import run
         return run(kind, D, a.folds, a.fast, **kw)
-    f.uses_prog = bool(kw.get("use_prog", False))  # arena 依此判斷是否用了比分推移特徵
+    # arena 依此判斷是否用了比分推移特徵（winner 的 use_prog，或 action/point 的 extra 裡含 PROG_FEATURES）
+    f.uses_prog = bool(kw.get("use_prog", False)) or bool(set(kw.get("extra", ())) & set(PROG_FEATURES))
     return f
 
 
@@ -29,7 +32,7 @@ def _nn(arch, **kw):
         from ttmatch.methods.nn import train_nn
         return train_nn(D, arch=arch, n_folds=a.folds, device=a.device, fast=a.fast,
                         epochs=a.epochs, n_seeds=a.seeds, **kw)
-    f.uses_prog = False
+    f.uses_prog = bool(kw.get("prog", False))
     return f
 
 
@@ -46,6 +49,53 @@ METHODS = {
     "cat": ("CatBoost 原生類別特徵，特徵同 lgbm_note（lucas6028 多樹模型）", _trees("cat", player_te=False)),
     "lgbm_prog": ("LightGBM winner + 比分推移特徵（本 repo 新增）", _trees("lgbm", targets=("w",), use_prog=True)),
     "cat_prog": ("CatBoost winner + 比分推移特徵（本 repo 新增）", _trees("cat", targets=("w",), use_prog=True)),
+    # --- 改善回合 1（本 repo 新增的實驗；全部用 lgbm_note 的特徵，不加選手 TE）---
+    "lgbm_mirror": ("LightGBM action/point + 左右鏡像訓練列（第 22 名的增強套到樹模型）",
+                    _trees("lgbm", targets=("a", "p"), player_te=False, mirror=True)),
+    "lgbm_bag3": ("LightGBM action/point，3 個 seed 平均（seed bagging）",
+                  _trees("lgbm", targets=("a", "p"), player_te=False, n_seeds=3)),
+    "lgbm_reg": ("LightGBM action/point，較強正則化（葉數 31、min_data 80、feature_fraction 0.6、l2 5）",
+                 _trees("lgbm", targets=("a", "p"), player_te=False,
+                        params=dict(num_leaves=31, min_data_in_leaf=80, feature_fraction=0.6, lambda_l2=5.0))),
+    "lgbm_big": ("LightGBM action/point，較大模型（葉數 127、min_data 20、lr 0.03、3000 輪上限）",
+                 _trees("lgbm", targets=("a", "p"), player_te=False,
+                        params=dict(num_leaves=127, min_data_in_leaf=20, learning_rate=0.03, rounds=3000))),
+    "xgb_mirror": ("XGBoost action/point + 左右鏡像訓練列",
+                   _trees("xgb", targets=("a", "p"), player_te=False, mirror=True)),
+    "xgb_prog": ("XGBoost winner + 比分推移特徵", _trees("xgb", targets=("w",), use_prog=True)),
+    "lgbm_prog_bag3": ("LightGBM winner + 比分推移，3 seed", _trees("lgbm", targets=("w",), use_prog=True, n_seeds=3)),
+    "cat_prog_bag3": ("CatBoost winner + 比分推移，3 seed", _trees("cat", targets=("w",), use_prog=True, n_seeds=3)),
+    "lgbm_pair": ("LightGBM action/point + 目前擊球者 ID（對戰組合資訊）",
+                  _trees("lgbm", targets=("a", "p"), player_te=False, extra=("cur_player",))),
+    "lgbm_hist": ("LightGBM action/point + 同場先前 rally 的選手傾向（history 特徵）",
+                  _trees("lgbm", targets=("a", "p"), player_te=False, extra=tuple(HIST_FEATURES))),
+    "lgbm_pair_hist": ("LightGBM action/point + 目前擊球者 ID + history 特徵",
+                       _trees("lgbm", targets=("a", "p"), player_te=False,
+                              extra=("cur_player",) + tuple(HIST_FEATURES))),
+    "lgbm_hist_w": ("LightGBM winner + 比分推移 + history 特徵",
+                    _trees("lgbm", targets=("w",), use_prog=True, extra=tuple(HIST_FEATURES))),
+    "xgb_hist": ("XGBoost action/point + history 特徵",
+                 _trees("xgb", targets=("a", "p"), player_te=False, extra=tuple(HIST_FEATURES))),
+    "xgb_hist2": ("XGBoost action/point + 雙方 history 特徵（下一拍擊球者 + 目前擊球者）",
+                  _trees("xgb", targets=("a", "p"), player_te=False, extra=tuple(HIST_FEATURES + OHIST_FEATURES))),
+    "cat_hist": ("CatBoost action/point + history 特徵",
+                 _trees("cat", targets=("a", "p"), player_te=False, extra=tuple(HIST_FEATURES))),
+    "lgbm_hist2": ("LightGBM action/point + 雙方 history 特徵",
+                   _trees("lgbm", targets=("a", "p"), player_te=False, extra=tuple(HIST_FEATURES + OHIST_FEATURES))),
+    "transformer_hist": ("因果 Transformer + history 特徵（每拍附下一拍擊球者的同場傾向）",
+                         _nn("transformer", hist=True)),
+    "gru_pemb_hist": ("GRU + 選手 ID 嵌入 + history 特徵", _nn("gru", player_emb=True, player_te=False, hist=True)),
+    "transformer_hist2": ("因果 Transformer + 雙方 history 特徵", _nn("transformer", hist="both")),
+    # 比分推移揭露 rally 勝方 → 下一拍擊球者若是輸家，這拍有 39% 是失誤（落點 0）；若是勝方只有 0.7%
+    "xgb_hist2_prog": ("XGBoost action/point + 雙方 history + 比分推移特徵",
+                       _trees("xgb", targets=("a", "p"), player_te=False,
+                              extra=tuple(HIST_FEATURES + OHIST_FEATURES + PROG_FEATURES))),
+    "transformer_hist2_prog": ("因果 Transformer + 雙方 history + 比分推移特徵（三任務都用）",
+                               _nn("transformer", hist="both", prog=True)),
+    "lgbm_hist_prog": ("LightGBM action/point + history + 比分推移特徵",
+                       _trees("lgbm", targets=("a", "p"), player_te=False,
+                              extra=tuple(HIST_FEATURES + PROG_FEATURES))),
+    "gru_hist": ("因果 GRU + history 特徵", _nn("gru", hist=True)),
     "gru": ("因果 GRU 多任務序列模型（第 3 名 0000workjason）", _nn("gru")),
     "transformer": ("因果 Transformer 多任務序列模型（第 3 名 0000workjason）", _nn("transformer")),
     "gru_t2v_film": ("GRU + Time2Vec + FiLM（第 5 名 SugarSquirrel v8）", _nn("t2v_film")),
@@ -65,6 +115,7 @@ def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--epochs", type=int, default=16)
     ap.add_argument("--seeds", type=int, default=2)
+    ap.add_argument("--suffix", default="", help="輸出檔名後綴，例如 _s3 → outputs/oof/<name>_s3.npz（不覆寫原檔）")
     a = ap.parse_args()
     if a.list or not a.methods:
         for k, (desc, _) in METHODS.items():
@@ -83,7 +134,7 @@ def main():
         out["prefix_len"] = D["ap_base"]["prefix_len"].to_numpy()
         out["test_rally_uid"] = D["test_pred"]["rally_uid"].to_numpy()
         out["uses_prog"] = np.array(fn.uses_prog)
-        suffix = "_fast" if a.fast else ""
+        suffix = a.suffix + ("_fast" if a.fast else "")
         path = config.OOF_DIR / f"{name}{suffix}.npz"
         np.savez_compressed(path, **out)
         print(f"   saved {path.name} ({time.time() - t0:.0f}s)", flush=True)
