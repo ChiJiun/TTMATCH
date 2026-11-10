@@ -14,6 +14,7 @@ import numpy as np
 
 from ttmatch import config
 from ttmatch.data import build_datasets
+from ttmatch.features import PROG_FEATURES
 from ttmatch.history import HIST_FEATURES, OHIST_FEATURES
 
 
@@ -21,7 +22,8 @@ def _trees(kind, **kw):
     def f(D, a):
         from ttmatch.methods.trees import run
         return run(kind, D, a.folds, a.fast, **kw)
-    f.uses_prog = bool(kw.get("use_prog", False))  # arena 依此判斷是否用了比分推移特徵
+    # arena 依此判斷是否用了比分推移特徵（winner 的 use_prog，或 action/point 的 extra 裡含 PROG_FEATURES）
+    f.uses_prog = bool(kw.get("use_prog", False)) or bool(set(kw.get("extra", ())) & set(PROG_FEATURES))
     return f
 
 
@@ -84,6 +86,13 @@ METHODS = {
                          _nn("transformer", hist=True)),
     "gru_pemb_hist": ("GRU + 選手 ID 嵌入 + history 特徵", _nn("gru", player_emb=True, player_te=False, hist=True)),
     "transformer_hist2": ("因果 Transformer + 雙方 history 特徵", _nn("transformer", hist="both")),
+    # 比分推移揭露 rally 勝方 → 下一拍擊球者若是輸家，這拍有 39% 是失誤（落點 0）；若是勝方只有 0.7%
+    "xgb_hist2_prog": ("XGBoost action/point + 雙方 history + 比分推移特徵",
+                       _trees("xgb", targets=("a", "p"), player_te=False,
+                              extra=tuple(HIST_FEATURES + OHIST_FEATURES + PROG_FEATURES))),
+    "lgbm_hist_prog": ("LightGBM action/point + history + 比分推移特徵",
+                       _trees("lgbm", targets=("a", "p"), player_te=False,
+                              extra=tuple(HIST_FEATURES + PROG_FEATURES))),
     "gru_hist": ("因果 GRU + history 特徵", _nn("gru", hist=True)),
     "gru": ("因果 GRU 多任務序列模型（第 3 名 0000workjason）", _nn("gru")),
     "transformer": ("因果 Transformer 多任務序列模型（第 3 名 0000workjason）", _nn("transformer")),

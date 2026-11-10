@@ -200,3 +200,14 @@ def test_match_history_uses_only_earlier_rallies():
     # keep_prob=0 → 沒有任何 rally 可見
     h3 = match_history(df, None, 0.0).set_index(["match", "numberGame", "rally_id", "next_player"])
     assert (h3["hist_n"] == 0).all()
+
+
+def test_mixed_score_two_dimensional():
+    from arena import mixed_score
+    rng = np.random.default_rng(3)
+    groups = np.repeat(np.arange(20), 10)
+    main, plain = np.zeros((200, 3)), np.ones((200, 3))
+    seen = []
+    m, s = mixed_score(lambda p: seen.append(p) or float(p[:, 0].mean()), groups, main, plain, 0.25, repeats=3)
+    assert abs(m - 0.25) < 1e-12 and s == 0.0          # 每次剛好 5 / 20 場 match 換成 plain
+    assert all(((p == 0) | (p == 1)).all() and (p.min(1) == p.max(1)).all() for p in seen)  # 整列一起換

@@ -128,19 +128,26 @@ def uses_prog(name: str, z: dict) -> bool:
     return name.endswith("_prog")
 
 
-def mixed_auc(ev, groups: np.ndarray, main_oof: np.ndarray, plain_oof: np.ndarray,
-              frac: float, repeats: int = 20, seed: int = config.SEED) -> tuple[float, float]:
-    """模擬 test 的情況：隨機挑 frac 比例的 match 改用 plain 集成，其餘用主集成，回傳整體 AUC 的平均與標準差。"""
+def mixed_score(score_fn, groups: np.ndarray, main_oof: np.ndarray, plain_oof: np.ndarray,
+                frac: float, repeats: int = 20, seed: int = config.SEED) -> tuple[float, float]:
+    """模擬 test 的情況：隨機挑 frac 比例的 match 改用 plain 集成，其餘用主集成，回傳整體分數的平均與標準差。
+    main_oof / plain_oof 可以是一維（winner 機率）或二維（類別機率）。"""
     rng = np.random.default_rng(seed)
     uniq = np.unique(groups)
     k = int(round(frac * len(uniq)))
     if k == 0:
-        return float(ev.auc(main_oof)), 0.0
+        return float(score_fn(main_oof)), 0.0
     scores = []
     for _ in range(repeats):
         pick = np.isin(groups, rng.choice(uniq, size=k, replace=False))
-        scores.append(ev.auc(np.where(pick, plain_oof, main_oof)))
+        if main_oof.ndim == 2:
+            pick = pick[:, None]
+        scores.append(score_fn(np.where(pick, plain_oof, main_oof)))
     return float(np.mean(scores)), float(np.std(scores))
+
+
+def mixed_auc(ev, groups, main_oof, plain_oof, frac, repeats: int = 20, seed: int = config.SEED):
+    return mixed_score(ev.auc, groups, main_oof, plain_oof, frac, repeats, seed)
 
 
 def nested_estimate(ev: Evaluator, names, oof, task):
@@ -250,6 +257,7 @@ def main():
 
     # --- 2. 各任務貪婪集成 ---
     final = {}
+    unreliable = test_df["prog_unreliable"].to_numpy().astype(bool)
     for task, key, label in (("a", "oof_a", "action"), ("p", "oof_p", "point")):
         names = [n for n, z in methods.items() if key in z]
         log.append(f"[{label}] 貪婪集成（快速調參版分數）")
@@ -271,6 +279,22 @@ def main():
                 score, use_override = s_ov, True
         final[task] = dict(oof=b_oof, test=b_test, recipe=recipe, score=score,
                            override=use_override, depth=use_depth)
+        # 有些 action/point 方法也用比分推移特徵；test 異常 match 的列改用不含它的集成（同 winner）
+        plain = [n for n in names if not uses_prog(n, methods[n])]
+        if unreliable.any() and plain and len(plain) < len(names):
+            log.append(f"[{label}] 不含比分推移的集成（用於 test 異常 match 的 {int(unreliable.sum())} 列）")
+            p_oof, p_test, p_recipe, _ = greedy_blend(
+                plain, {n: oof[n] for n in plain}, {n: test[n] for n in plain},
+                lambda p, t=task: ev.f1(p, t, quick=True), log)
+            final[task].update(oof_plain=p_oof, test_plain=p_test, recipe_plain=p_recipe,
+                               score_plain=ev.f1(p_oof, task), frac_plain=float(unreliable.mean()))
+            final[task]["score_mixed"] = mixed_score(
+                lambda p, t=task: ev.f1(p, t, quick=True), base["match"].to_numpy(), b_oof, p_oof,
+                float(unreliable.mean()), repeats=10)
+            # mixed 用快速調參估計；換算成與 score 同尺度：score − (快速版主集成 − 快速版混合)
+            q_main = ev.f1(b_oof, task, quick=True)
+            final[task]["score_mixed"] = (score - (q_main - final[task]["score_mixed"][0]),
+                                          final[task]["score_mixed"][1])
 
     names = [n for n, z in methods.items() if "oof_w" in z]
     log.append("[winner] 貪婪集成（AUC）")
@@ -280,7 +304,6 @@ def main():
     final["w"] = dict(oof=b_oof, test=b_test, recipe=recipe, score=ev.auc(b_oof))
     # test 異常 match 的 rally 拿不到比分推移資訊；train 中「沒有下一個 rally」幾乎都在局末，
     # 直接用含比分推移的模型會把它們當成局末。這些列改用不含比分推移特徵的方法另做一組集成。
-    unreliable = test_df["prog_unreliable"].to_numpy().astype(bool)
     plain = [n for n in names if not uses_prog(n, methods[n])]
     if unreliable.any() and plain and len(plain) < len(names):
         log.append(f"[winner] 不含比分推移的集成（用於 test 異常 match 的 {int(unreliable.sum())} 列）")
@@ -305,8 +328,9 @@ def main():
             nested[task] = nested_estimate(ev, names, {n: methods[n][key] for n in names}, task)
             print(f"   巢狀估計 {task} 完成", flush=True)
         nested["overall"] = overall_score(nested["a"][0], nested["p"][0], nested["w"][0])
-    overall_mixed = (overall_score(final["a"]["score"], final["p"]["score"], final["w"]["score_mixed"][0])
-                     if "score_mixed" in final["w"] else None)
+    has_mixed = any("score_mixed" in final[t] for t in ("a", "p", "w"))
+    overall_mixed = (overall_score(*[final[t].get("score_mixed", (final[t]["score"],))[0] for t in ("a", "p", "w")])
+                     if has_mixed else None)
 
     # --- 3. 產生提交檔：決策規則用全部長度對齊樣本調參 ---
     all_sel = np.concatenate(ev.sel)
@@ -322,6 +346,10 @@ def main():
         else:
             dec, _ = tune_decision(final[task]["oof"][all_sel], y[all_sel], classes)
             pred = apply_decision(final[task]["test"], classes, dec)
+        if "test_plain" in final[task]:
+            dec_p, _ = tune_decision(final[task]["oof_plain"][all_sel], y[all_sel], classes)
+            pred_plain = apply_decision(final[task]["test_plain"], classes, dec_p)
+            pred = np.where(unreliable, pred_plain, pred)
         if final[task]["override"]:
             pred = apply_override(test_df, pred, fit_table(base, TASKS[task][0]))
         sub[col] = pred.astype(int)
@@ -342,7 +370,9 @@ def main():
              "以下分數的決策規則仍是跨半調參，但集成成員、權重、分深度決策與規則修正都是依同一套分數挑選的，"
              "因此含選擇偏差、會略為樂觀；單一方法排行榜沒有這層選擇。", "",
              *[f"- {lab} Macro-F1：{final[t]['score']:.4f}"
-               f"（分深度決策：{'是' if final[t]['depth'] else '否'}；規則修正：{'是' if final[t]['override'] else '否'}）"
+               f"（分深度決策：{'是' if final[t]['depth'] else '否'}；規則修正：{'是' if final[t]['override'] else '否'}"
+               + (f"；test 異常 match 改用不含比分推移的集成，其 CV {final[t]['score_plain']:.4f}"
+                  if "score_plain" in final[t] else "") + "）"
                for t, lab in (("a", "action"), ("p", "point"))],
              f"- winner AUC：{final['w']['score']:.4f}"
              + (f"（test 異常 match 改用不含比分推移的集成，其 CV AUC {final['w']['score_plain']:.4f}）"
@@ -352,14 +382,17 @@ def main():
                 f"point {nested['p'][0]:.4f}、winner {nested['w'][0]:.4f}、**overall {nested['overall']:.4f}**；"
                 f"同樣方式只挑單一最佳方法：action {nested['a'][1]:.4f}、point {nested['p'][1]:.4f}、"
                 f"winner {nested['w'][1]:.4f}"] if nested else []),
-             *([f"- 預期 test 表現：test 有 {final['w']['frac_plain']:.1%} 的列改用不含比分推移的集成，"
-                f"在 CV 上隨機挑同比例的 match 模擬，winner AUC 約 {final['w']['score_mixed'][0]:.4f}"
-                f"（±{final['w']['score_mixed'][1]:.4f}），overall 約 {overall_mixed:.4f}"]
+             *([f"- 預期 test 表現：test 有 {float(unreliable.mean()):.1%} 的列改用不含比分推移的集成，"
+                f"在 CV 上隨機挑同比例的 match 模擬："
+                + "、".join(f"{lab} 約 {final[t]['score_mixed'][0]:.4f}（±{final[t]['score_mixed'][1]:.4f}）"
+                           for t, lab in (("a", "action"), ("p", "point"), ("w", "winner"))
+                           if "score_mixed" in final[t])
+                + f"，overall 約 **{overall_mixed:.4f}**"]
                if overall_mixed is not None else []), "",
              "配方：", "```json",
              json.dumps({**{t: [(n, round(w, 3)) for n, w in final[t]["recipe"]] for t in ("a", "p", "w")},
-                         **({"w_plain": [(n, round(w, 3)) for n, w in final["w"]["recipe_plain"]]}
-                            if "recipe_plain" in final["w"] else {})},
+                         **{f"{t}_plain": [(n, round(w, 3)) for n, w in final[t]["recipe_plain"]]
+                            for t in ("a", "p", "w") if "recipe_plain" in final[t]}},
                         ensure_ascii=False, indent=1), "```", "",
              f"提交檔：`{_display_path(sub_path)}`"]
     report = config.OUT_DIR / f"arena_report{suffix}.md"
