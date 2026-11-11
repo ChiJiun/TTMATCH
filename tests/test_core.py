@@ -84,6 +84,17 @@ def test_mirror_is_involution():
     assert (POSITION_MIRROR[POSITION_MIRROR] == np.arange(4)).all()
 
 
+def test_winner_extra_dedups_and_keeps_order():
+    from ttmatch.features import PROG_FEATURES
+    from ttmatch.methods.trees import winner_extra
+    assert winner_extra(False) == []
+    assert winner_extra(True) == list(PROG_FEATURES)
+    # extra 與 PROG_FEATURES 重疊時只保留一份，順序為 PROG_FEATURES 在前
+    out = winner_extra(True, ["hist_n", PROG_FEATURES[0], "hist_n"])
+    assert out == list(PROG_FEATURES) + ["hist_n"]
+    assert len(out) == len(set(out))
+
+
 def test_uses_prog_flag_and_fallback():
     from arena import uses_prog
     assert uses_prog("cat_prog", {}) and not uses_prog("cat", {})

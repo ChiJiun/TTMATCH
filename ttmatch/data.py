@@ -37,7 +37,7 @@ def build_datasets(use_test_aug: bool = True) -> dict:
     trf = trf.merge(score_progression_train(tr, gap_dist), on="rally_uid", how="left")
     tef = tef.merge(score_progression_test(te), on="rally_uid", how="left")
 
-    # 同場先前 rally 的選手傾向；train 依 test 的可見 rally 比例與前綴長度分佔模擬
+    # 同場先前 rally 的選手傾向；train 依 test 的可見 rally 比例與前綴長度分佈模擬
     trf = attach_history(trf, match_history(tr, test_length_probs(tef), test_visible_rally_frac(te)))
     tef = attach_history(tef, match_history(te))
 

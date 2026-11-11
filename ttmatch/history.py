@@ -3,13 +3,17 @@
 test 每場比賽平均可見 23 個 rally，而且 train 與 test 的比賽不重疊，所以「這位選手這場比賽到目前為止
 怎麼打」是選手 ID 之外合法可用的訊息（只用該 rally 之前的 rally，不碰任何要預測的那一拍）。
 
-分佈對齊（與比分推移特徵的 train 模擬同一精神）：test 跟 train 有三個差異，train 端都要模擬——
+分佈對齊（與比分推移特徵的 train 模擬同一精神）：test 跟 train 有以下差異，前兩點 train 端要模擬——
 1. test 每局只看得到約 34% 的 rally（rally_id 間隔 2–4）；
 2. test 的 rally 只看得到前綴 k 拍（多半 1–3 拍），且第 k+1 拍一定存在（那是要預測的拍），所以
-   看不到 rally 的最後一拍，而且長 rally 比短 rally 更容易成為可見 rally；
-→ train 先以 34% 機率決定每個 rally 是否可見，再把 test 的前綴長度分佔「配對」到可見 rally 上：
-   由長到短的 k 依序從「長度 ≥ k+1 且尚未指派」的 rally 中隨機挑出應有的數量；配不到的 rally 取
-   k = 長度 − 1。這樣可見 rally 的前綴長度分佔與 test 幾乎相同，且永遠不含 rally 的最後一拍。
+   看不到 rally 的最後一拍；
+→ train 先以 34% 機率決定每個 rally 是否可見（這一步與 rally 長度無關），再把 test 的前綴長度分佈
+   「配對」到可見 rally 上：由長到短的 k 依序從「長度 ≥ k+1 且尚未指派」的 rally 中隨機挑出應有的
+   數量；配不到的 rally 取 k = 長度 − 1。偏向長 rally 的只有 k 的分配（長 k 只能配給夠長的 rally），
+   不是「哪些 rally 可見」。這樣可見 rally 的前綴長度分佈與 test 幾乎相同，且永遠不含 rally 的最後一拍。
+3. test 的異常 match（340–354，每場 21–31 位選手、rally_id 與比分不符）也照樣計算 history：這些 match
+   的資料混雜，同一 match 內同一選手的「較早 rally」不一定代表同一場實際比賽的先前狀態，統計量比較雜、
+   hist_n 也偏低。目前不另外處理（train 沒有對應的模擬），只在這裡註明。
 """
 from __future__ import annotations
 import numpy as np
@@ -70,7 +74,7 @@ def match_history(df: pd.DataFrame, len_probs: dict | None = None, keep_prob: fl
     """回傳以 HIST_KEYS 為鍵的表：該選手在同場比賽、(numberGame, rally_id) 之前的 rally 裡可見拍的統計量。
 
     df 是原始擊球表。test：len_probs=keep_prob=None，全部已觀測的拍都算。
-    train：給 test 的前綴長度分佔與可見 rally 比例，模擬 test 的截斷與抽樣（見模組說明）。
+    train：給 test 的前綴長度分佈與可見 rally 比例，模擬 test 的截斷與抽樣（見模組說明）。
     鍵集合 = df 中所有 (match, game, rally, 擊球者) ∪ (match, game, rally, 對手)，所以每一列都能對到。
     """
     vis = df[_visible_mask(df, len_probs, keep_prob, seed)]

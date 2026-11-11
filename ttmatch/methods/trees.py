@@ -158,10 +158,19 @@ def train_multiclass(kind, D, target_col, classes, n_folds=config.N_FOLDS, fast=
     return oof, test_pred
 
 
+def winner_extra(use_prog, extra=()):
+    """winner 模型的額外特徵欄：use_prog 時加上 PROG_FEATURES，再接 extra；去重複並保留順序。
+
+    目前的方法不會重疊（lgbm_hist_prog 等把比分推移放在 extra 的方法只訓練 action/point），這是防呆：
+    若之後有方法同時 use_prog=True 又在 extra 放比分推移欄，不去重複會產生重複欄名，部分套件會報錯。
+    """
+    return list(dict.fromkeys((list(PROG_FEATURES) if use_prog else []) + list(extra)))
+
+
 def train_winner(kind, D, n_folds=config.N_FOLDS, fast=False, use_prog=False, n_seeds=1, params=None,
                  extra=()):
     base_df, test_df = D["ap_base"], D["test_pred"]
-    extra = (PROG_FEATURES if use_prog else []) + list(extra)
+    extra = winner_extra(use_prog, extra)
     yb = base_df["winner"].astype(int).to_numpy()
     oof = np.zeros(len(base_df))
     test_pred = np.zeros(len(test_df))
