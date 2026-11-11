@@ -11,9 +11,9 @@ test 每場比賽平均可見 23 個 rally，而且 train 與 test 的比賽不�
    「配對」到可見 rally 上：由長到短的 k 依序從「長度 ≥ k+1 且尚未指派」的 rally 中隨機挑出應有的
    數量；配不到的 rally 取 k = 長度 − 1。偏向長 rally 的只有 k 的分配（長 k 只能配給夠長的 rally），
    不是「哪些 rally 可見」。這樣可見 rally 的前綴長度分佈與 test 幾乎相同，且永遠不含 rally 的最後一拍。
-3. test 的異常 match（340–354，每場 21–31 位選手、rally_id 與比分不符）也照樣計算 history：這些 match
-   的資料混雜，同一 match 內同一選手的「較早 rally」不一定代表同一場實際比賽的先前狀態，統計量比較雜、
-   hist_n 也偏低。目前不另外處理（train 沒有對應的模擬），只在這裡註明。
+3. test 的 match 340–354 是被打散的 rally。能定位的（187 個）已先放回原本的比賽（ttmatch/relocate.py），
+   它們的 history 與正常 rally 相同；定位不出來的 75 個留在假的 match 裡，幾乎沒有 history（hist_n 接近 0），
+   特徵會退回全體平均。
 """
 from __future__ import annotations
 import numpy as np

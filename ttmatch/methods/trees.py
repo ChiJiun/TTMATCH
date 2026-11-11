@@ -4,8 +4,15 @@
   0000workjason/aicup2026-tabletennis-prediction（私榜第 3 名）solution/model_lgbm.py
 - XGBoost / CatBoost 對照組參考 lucas6028/AI_CUP_2026_Table_Tennis_Prediction（前標）的多樹模型比較
 - winner 模型可加入本 repo 新增的比分推移特徵（PROG_FEATURES）
+
+test 內部轉移擴充（use_aug）預設關閉。這些列來自 test rally 自己較短的前綴，而且一定不是 rally 的最後一拍；
+樹模型會記住「這個 rally / 這位選手的列都不是終結拍」，於是對同一個 rally 真正要預測的那一列幾乎不預測
+落點 0：LightGBM + history 在 test 上的平均 P(落點 0) 只有 0.07，OOF 是 0.41；拿掉這些列後 test 是 0.40。
+CV 看不到這個偏差（驗證 fold 的 rally 沒有自己的前綴在訓練集裡）。序列模型沒有這個現象，仍使用這些列。
 """
 from __future__ import annotations
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -13,8 +20,11 @@ from .. import config
 from ..cv import get_folds
 from ..features import (CATEGORICAL, CATEGORICAL_OPTIONAL, PROG_FEATURES, get_X,
                         fit_target_encoding, apply_target_encoding, oof_target_encoding)
+from ..truncation import blend_aug_weights
 
 ACTION_TE_KEYS = [["next_player"], ["next_player", "last_action"], ["next_player", "next_strikeId"]]
+# 同時跑多個訓練行程時用來限制每個行程的執行緒數（CatBoost 預設會佔滿所有核心）；0 = 套件預設
+N_THREADS = int(os.environ.get("TTMATCH_THREADS", "0"))
 
 
 def _sample_weights(y_idx, n_class, temper=0.5):
@@ -51,7 +61,7 @@ def _fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast,
         params = dict(learning_rate=0.05, num_leaves=63 if n_class > 2 else 47,
                       min_data_in_leaf=40 if n_class > 2 else 60,
                       feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
-                      lambda_l2=1.0, num_threads=0, verbosity=-1, seed=seed)
+                      lambda_l2=1.0, num_threads=N_THREADS, verbosity=-1, seed=seed)
         params.update(po)
         if n_class > 2:
             params.update(objective="multiclass", num_class=n_class, metric="multi_logloss")
@@ -68,7 +78,7 @@ def _fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast,
         import xgboost as xgb
         params = dict(tree_method="hist", learning_rate=0.06, max_depth=7, subsample=0.8,
                       colsample_bytree=0.8, min_child_weight=3, reg_lambda=1.0,
-                      nthread=0, seed=seed)
+                      nthread=N_THREADS, seed=seed)
         params.update(po)
         if n_class > 2:
             params.update(objective="multi:softprob", num_class=n_class, eval_metric="mlogloss")
@@ -90,7 +100,7 @@ def _fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast,
             max_ctr_complexity=1, one_hot_max_size=20,
             loss_function="MultiClass" if n_class > 2 else "Logloss",
             eval_metric="MultiClass" if n_class > 2 else "AUC",
-            random_seed=seed, thread_count=-1, verbose=False,
+            random_seed=seed, thread_count=N_THREADS or -1, verbose=False,
             od_type="Iter", od_wait=60, allow_writing_files=False)
         cat_params.update(po)
         m = CatBoostClassifier(**cat_params)
@@ -102,9 +112,14 @@ def _fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast,
 
 
 def train_multiclass(kind, D, target_col, classes, n_folds=config.N_FOLDS, fast=False,
-                     te_keys=None, te_alpha=1.0, aug_weight_mult=5.0, use_aug=True, drop=(),
-                     mirror=False, mirror_weight=1.0, n_seeds=1, params=None, extra=()):
+                     te_keys=None, te_alpha=1.0, aug_weight_mult=5.0, use_aug=False, drop=(),
+                     mirror=False, mirror_weight=1.0, n_seeds=1, params=None, extra=(), align=True):
     """回傳 (oof, test_pred)，欄位順序 = classes。
+
+    align：訓練列依 test 的截斷機制加權（ap_base["align_w"]，見 ttmatch/truncation.py），讓訓練分佈的
+    前綴長度與終結拍比例對齊 test；aug 列併入時維持各前綴長度的終結拍比例。
+    use_aug：把 test 內部轉移（D["ap_aug"]）併入訓練。預設關閉，原因見本檔開頭；只有重現第 3 名原作法的
+    `lgbm` 與對照用的 `lgbm_hist_aug` 會打開。
 
     drop：要拿掉的特徵欄。extra：額外加入的特徵欄（例如 cur_player、HIST_FEATURES）。
     mirror：把訓練 fold 的左右鏡像列也加進訓練（標籤為 next_point 時一併鏡像），驗證 / test 永遠用原始列；
@@ -150,6 +165,18 @@ def train_multiclass(kind, D, target_col, classes, n_folds=config.N_FOLDS, fast=
         w_tr = _sample_weights(y_tr, C)
         w_tr[n_base:n_base + n_mirror] *= mirror_weight
         w_tr[n_base + n_mirror:] *= aug_weight_mult
+        if align:
+            b = base_df.iloc[rows]
+            wb = b["align_w"].to_numpy()
+            if aug_df is not None:
+                a = aug_df.iloc[np.where(ma)[0]]
+                wb, wa = blend_aug_weights(wb, b["prefix_len"].to_numpy(), b["is_terminal"].to_numpy(),
+                                           aug_weight_mult * a["align_w"].to_numpy(), a["prefix_len"].to_numpy())
+                wa = wa / aug_weight_mult      # aug_weight_mult 已乘在 w_tr 上，這裡只留對齊的部分
+            else:
+                wa = np.zeros(0)
+            w_al = np.concatenate([wb, np.tile(wb, 1 if n_mirror else 0), wa])
+            w_tr = w_tr * w_al / np.average(w_al, weights=w_tr)
         y_va = np.array([c2i.get(v, 0) for v in yb[va_idx]])
         p_va, p_te = _fit_predict(kind, C, X_tr, y_tr, w_tr, X_va, y_va, [X_va, X_te], fast,
                                   n_seeds=n_seeds, params_override=params)
@@ -168,7 +195,7 @@ def winner_extra(use_prog, extra=()):
 
 
 def train_winner(kind, D, n_folds=config.N_FOLDS, fast=False, use_prog=False, n_seeds=1, params=None,
-                 extra=()):
+                 extra=(), align=True):
     base_df, test_df = D["ap_base"], D["test_pred"]
     extra = winner_extra(use_prog, extra)
     yb = base_df["winner"].astype(int).to_numpy()
@@ -176,7 +203,8 @@ def train_winner(kind, D, n_folds=config.N_FOLDS, fast=False, use_prog=False, n_
     test_pred = np.zeros(len(test_df))
     X_all, X_te = get_X(base_df, extra), get_X(test_df, extra)
     for tr_idx, va_idx in get_folds(base_df["match"].to_numpy(), n_folds):
-        p_va, p_te = _fit_predict(kind, 2, X_all.iloc[tr_idx], yb[tr_idx], None,
+        w_tr = base_df["align_w"].to_numpy()[tr_idx] if align else None
+        p_va, p_te = _fit_predict(kind, 2, X_all.iloc[tr_idx], yb[tr_idx], w_tr,
                                   X_all.iloc[va_idx], yb[va_idx], [X_all.iloc[va_idx], X_te], fast,
                                   n_seeds=n_seeds, params_override=params)
         oof[va_idx] = p_va
@@ -186,10 +214,10 @@ def train_winner(kind, D, n_folds=config.N_FOLDS, fast=False, use_prog=False, n_
 
 def run(kind, D, n_folds=config.N_FOLDS, fast=False, player_te=True, targets=("a", "p", "w"),
         use_prog=False, te_alpha=1.0, drop=(), mirror=False, mirror_weight=1.0, n_seeds=1,
-        params=None, extra=()):
+        params=None, extra=(), align=True, use_aug=False):
     out = {}
     common = dict(drop=drop, mirror=mirror, mirror_weight=mirror_weight, n_seeds=n_seeds, params=params,
-                  extra=extra)
+                  extra=extra, align=align, use_aug=use_aug)
     if "a" in targets:
         out["oof_a"], out["te_a"] = train_multiclass(
             kind, D, "next_action", config.ACTION_CLASSES, n_folds, fast,
@@ -200,5 +228,5 @@ def run(kind, D, n_folds=config.N_FOLDS, fast=False, player_te=True, targets=("a
             kind, D, "next_point", config.POINT_CLASSES, n_folds, fast, **common)
     if "w" in targets:
         out["oof_w"], out["te_w"] = train_winner(kind, D, n_folds, fast, use_prog,
-                                                 n_seeds=n_seeds, params=params, extra=extra)
+                                                 n_seeds=n_seeds, params=params, extra=extra, align=align)
     return out
