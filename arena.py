@@ -2,16 +2,19 @@
 
 評估方式（所有方法一致）：
 1. OOF 來自依 match 分組的 5-fold（test 的 79 場比賽與 train 完全不重疊，所以必須按 match 切）。
-2. 每個 rally 依 test 前綴長度分佈抽一個前綴（重複 5 次），讓 CV 的長度組成跟 test 一樣。
+2. 每個 rally 依 test 的截斷機制抽一個前綴（重複 5 次；見 ttmatch/truncation.py），讓 CV 的前綴長度
+   分佈與「要預測的是不是 rally 最後一拍」的比例都跟 test 一樣。
 3. Macro-F1 的決策規則（溫度 + 類別偏置）用「另一半比賽」調參、在這一半評估，兩半互換取平均，
    避免在同一批資料上調參又評分而高估。
 4. 集成：每個任務各自做貪婪前向選擇（優勝劣汰）——從最佳單一方法開始，只有能讓誠實分數上升的
    方法才會被加入，其餘淘汰。
+5. 報告最後列出集成在 CV 抽樣與在 test 上「預測為各類別」的比例（prediction_shift）。兩邊差很多代表
+   test 端的預測與 CV 不一致，這種問題 CV 分數看不出來（樹模型誤用 test 內部轉移就是這樣發現的）。
 
 用法：
   python arena.py                                         # 全部方法 → outputs/submission.csv
-  python arena.py --exclude lgbm_prog cat_prog --tag noprog
-                                                          # 排除指定方法 → outputs/submission_noprog.csv
+  python arena.py --preset noprog --tag noprog            # 不用比分推移特徵 → outputs/submission_noprog.csv
+  python arena.py --exclude lgbm_prog cat_prog --tag x    # 排除指定方法（可與 --preset 併用）
   python arena.py --fast                                  # 讀 *_fast.npz（冒煙測試）
   python arena.py --no-override                           # 不嘗試規則修正
   python arena.py --no-nested                             # 跳過巢狀估計
@@ -28,8 +31,8 @@ import pandas as pd
 from sklearn.model_selection import GroupKFold
 
 from ttmatch import config
-from ttmatch.cv import length_matched_indices
-from ttmatch.data import build_datasets, test_length_probs
+from ttmatch.data import build_datasets
+from ttmatch.truncation import cut_matched_indices
 from ttmatch.decision import (tune_decision, apply_decision,
                               tune_decision_by_depth, apply_decision_by_depth)
 from ttmatch.metrics import macro_f1, winner_auc, overall_score
@@ -37,16 +40,34 @@ from ttmatch.postprocess import fit_table, apply_override
 
 TASKS = {"a": ("next_action", config.ACTION_CLASSES), "p": ("next_point", config.POINT_CLASSES)}
 
-# README「結果」所用的方法集（改善回合 1 的結論）。依巢狀估計挑選：再加入 action/point 也用比分推移的
-# lgbm_hist_prog / xgb_hist2_prog / transformer_hist2_prog，巢狀估計反而從 0.4177 降到 0.4157，因此不納入。
-FINAL_METHODS = [
+# 改善回合 1 的方法集（PR #4 的 README 結果）。回合 2 的比較基準：這組 npz 在新的評估抽樣下重新計分。
+R1_METHODS = [
     "cat", "cat_hist", "cat_prog", "cat_prog_bag3", "gru", "gru_hist", "gru_mirror", "gru_pemb", "gru_pemb_hist",
     "gru_t2v_film", "lgbm_hist", "lgbm_hist2", "lgbm_note", "lgbm_prog", "transformer", "transformer_hist",
     "transformer_hist2", "transformer_pemb", "xgb", "xgb_hist", "xgb_hist2", "xgb_prog",
 ]
+# README「結果」所用的方法集（改善回合 2）。樹模型都不用 test 內部轉移擴充（見 ttmatch/methods/trees.py）；
+# winner 一律依截斷機制加權；action/point 兩種都放（預設加權，`_eq` 不加權），序列模型含 history 的加權版
+# （`_al`）與不加權版都放，交給貪婪選擇與巢狀估計挑。CatBoost 的 action/point 太慢（單一方法約 1–1.5 小時）
+# 而且前兩輪都沒被選進集成，這一輪沒有重訓，不在候選裡。
+FINAL_METHODS = [
+    # winner（比分推移）
+    "cat_prog", "cat_prog_bag3", "lgbm_prog", "xgb_prog", "cat_hist_w", "lgbm_hist_w", "xgb_hist_w",
+    # 三任務的樹模型（不含比分推移；winner 也供放不回去的打散 rally 使用）
+    "xgb", "lgbm_note",
+    # action / point：加權版
+    "lgbm_hist", "lgbm_hist2", "xgb_hist2", "lgbm_hist_prog", "xgb_hist2_prog",
+    # action / point：不加權的對照
+    "xgb_eq", "lgbm_note_eq", "lgbm_hist_eq", "lgbm_hist2_eq", "xgb_hist2_eq",
+    # 序列模型
+    "gru_hist_al", "transformer_hist2_al", "transformer_hist2_prog_al", "gru_pemb_hist_al", "transformer_hist2",
+    "gru", "transformer", "gru_pemb", "transformer_pemb", "gru_t2v_film", "gru_mirror",
+]
 # 不含比分推移特徵的版本（課堂規則若不允許比分推移時使用）
-NOPROG_METHODS = [m for m in FINAL_METHODS if not m.endswith("_prog") and m != "cat_prog_bag3"]
-PRESETS = {"final": FINAL_METHODS, "noprog": NOPROG_METHODS}
+PROG_METHODS = {"cat_prog", "cat_prog_bag3", "lgbm_prog", "xgb_prog", "cat_hist_w", "lgbm_hist_w", "xgb_hist_w",
+                "lgbm_hist_prog", "xgb_hist2_prog", "transformer_hist2_prog_al"}
+NOPROG_METHODS = [m for m in FINAL_METHODS if m not in PROG_METHODS]
+PRESETS = {"final": FINAL_METHODS, "noprog": NOPROG_METHODS, "r1": R1_METHODS}
 BLEND_GRID = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
 MIN_GAIN = 5e-4
 
@@ -54,7 +75,7 @@ MIN_GAIN = 5e-4
 class Evaluator:
     def __init__(self, D, repeats=5):
         self.base = D["ap_base"]
-        self.sel = length_matched_indices(self.base, test_length_probs(D["tef"]), repeats)
+        self.sel = cut_matched_indices(self.base, D["cut_g"], repeats)
         half = np.zeros(len(self.base), dtype=int)
         gkf = GroupKFold(n_splits=2)
         for h, (_, idx) in enumerate(gkf.split(self.base, groups=self.base["match"])):
@@ -218,6 +239,22 @@ def greedy_blend(names, oof, test, score_fn, log):
     return cur_oof, cur_test, recipe, single
 
 
+def prediction_shift(pred_cv, pred_test, classes):
+    """「預測為各類別」的比例在 CV 抽樣與 test 上各是多少，以及兩者的總變異距離（0 = 相同，1 = 完全不同）。
+
+    CV 的評估樣本已對齊 test 的截斷機制，所以兩邊的預測分佈應該接近；差很多代表 test 端的預測與 CV 不一致
+    （例如訓練時混入了只有 test 才有的列），這種問題 CV 分數看不出來。"""
+    pred_cv, pred_test = np.asarray(pred_cv), np.asarray(pred_test)
+    cv = np.array([(pred_cv == c).mean() for c in classes])
+    te = np.array([(pred_test == c).mean() for c in classes])
+    return cv, te, 0.5 * float(np.abs(cv - te).sum())
+
+
+# 預測分佈的總變異距離超過這個值就在報告裡警告。test 的選手組成與 train 不同，正常情況約 0.07–0.10；
+# 樹模型誤用 test 內部轉移時 point 是 0.32–0.40。
+SHIFT_WARN = 0.15
+
+
 def _display_path(p: Path) -> str:
     """repo 內的路徑顯示相對路徑，否則顯示絕對路徑（設了 TTMATCH_OUT_DIR 時）。"""
     try:
@@ -233,10 +270,12 @@ def main():
     ap.add_argument("--exclude", nargs="*", default=[], help="不納入比較的方法名稱，例如 lgbm_prog cat_prog")
     ap.add_argument("--tag", default="", help="輸出檔名後綴，例如 noprog → submission_noprog.csv")
     ap.add_argument("--no-nested", action="store_true", help="跳過巢狀估計（省時間）")
-    ap.add_argument("--preset", choices=sorted(PRESETS), help="只用預先定義的方法集（final / noprog）")
+    ap.add_argument("--preset", choices=sorted(PRESETS), help="只用預先定義的方法集（final / noprog / r1）")
+    ap.add_argument("--no-relocate", action="store_true",
+                    help="不把 test 打散的 rally 放回原比賽（對照用；OOF 也必須是在同樣設定下訓練的）")
     args = ap.parse_args()
 
-    D = build_datasets()
+    D = build_datasets(relocate=not args.no_relocate)
     base, test_df = D["ap_base"], D["test_pred"]
     methods = load_methods(config.OOF_DIR, base, test_df["rally_uid"].to_numpy(), args.fast)
     if not methods:
@@ -244,12 +283,12 @@ def main():
     unknown = sorted(set(args.exclude) - methods.keys())
     if unknown:
         print(f"警告：--exclude 中的 {', '.join(unknown)} 不在 outputs/oof/ 裡，已忽略", flush=True)
-    methods = {n: z for n, z in methods.items() if n not in set(args.exclude)}
     if args.preset:
         missing = sorted(set(PRESETS[args.preset]) - methods.keys())
         if missing:
             raise SystemExit(f"--preset {args.preset} 需要的方法還沒訓練：{', '.join(missing)}（請先執行 run_method.py）")
         methods = {n: methods[n] for n in PRESETS[args.preset]}
+    methods = {n: z for n, z in methods.items() if n not in set(args.exclude)}   # 可與 --preset 併用
     if not methods:
         raise SystemExit("--exclude 排除了所有方法，沒有剩下可比較的方法")
     ev = Evaluator(D)
@@ -353,10 +392,14 @@ def main():
     has_mixed = any("score_mixed" in final[t] for t in ("a", "p", "w"))
     overall_mixed = (overall_score(*[final[t].get("score_mixed", (final[t]["score"],))[0] for t in ("a", "p", "w")])
                      if has_mixed else None)
+    # 巢狀估計再扣掉「異常列改用 plain 集成」的折減（折減量取自 in-sample 的 主集成 − 混合）
+    nested_mixed = (overall_score(*[nested[t][0] - (final[t]["score"] - final[t].get("score_mixed", (final[t]["score"],))[0])
+                                    for t in ("a", "p", "w")]) if (nested and has_mixed) else None)
 
     # --- 3. 產生提交檔：決策規則用全部長度對齊樣本調參 ---
     all_sel = np.concatenate(ev.sel)
     sub = pd.DataFrame({"rally_uid": test_df["rally_uid"].to_numpy()})
+    shift = {}
     for task, col in (("a", "actionId"), ("p", "pointId")):
         classes = TASKS[task][1]
         y = ev.y[task]
@@ -365,9 +408,12 @@ def main():
             decs = tune_decision_by_depth(final[task]["oof"][all_sel], y[all_sel], classes, plen[all_sel])
             pred = apply_decision_by_depth(final[task]["test"], classes, decs,
                                            test_df["prefix_len"].to_numpy())
+            pred_cv = apply_decision_by_depth(final[task]["oof"][all_sel], classes, decs, plen[all_sel])
         else:
             dec, _ = tune_decision(final[task]["oof"][all_sel], y[all_sel], classes)
             pred = apply_decision(final[task]["test"], classes, dec)
+            pred_cv = apply_decision(final[task]["oof"][all_sel], classes, dec)
+        shift[task] = prediction_shift(pred_cv, pred[~unreliable] if unreliable.any() else pred, classes)
         if "test_plain" in final[task]:
             dec_p, _ = tune_decision(final[task]["oof_plain"][all_sel], y[all_sel], classes)
             pred_plain = apply_decision(final[task]["test_plain"], classes, dec_p)
@@ -409,8 +455,25 @@ def main():
                 + "、".join(f"{lab} 約 {final[t]['score_mixed'][0]:.4f}（±{final[t]['score_mixed'][1]:.4f}）"
                            for t, lab in (("a", "action"), ("p", "point"), ("w", "winner"))
                            if "score_mixed" in final[t])
-                + f"，overall 約 **{overall_mixed:.4f}**"]
+                + f"，overall 約 **{overall_mixed:.4f}**"
+                + (f"；同樣的折減套在巢狀估計上：overall 約 **{nested_mixed:.4f}**" if nested_mixed is not None else "")]
                if overall_mixed is not None else []), "",
+             "## CV 與 test 的預測分佈", "",
+             "同一組決策規則下「預測為各類別」的比例。CV 的評估樣本已對齊 test 的截斷機制，兩邊應該接近；"
+             "差很多代表 test 端的預測與 CV 不一致，CV 分數不可信。", "",
+             "| 任務 | | " + " | ".join(str(c) for c in range(max(len(TASKS[t][1]) for t in shift))) + " | 總變異距離 |",
+             "|---|---|" + "---:|" * (max(len(TASKS[t][1]) for t in shift) + 1),
+             *[f"| {lab} | {where} | " + " | ".join(
+                 [f"{v:.3f}" for v in vals] + [""] * (max(len(TASKS[x][1]) for x in shift) - len(vals)))
+               + f" | {shift[t][2]:.3f} |"
+               for t, lab in (("a", "action"), ("p", "point"))
+               for where, vals in (("CV", shift[t][0]), ("test", shift[t][1]))],
+             "",
+             f"- winner 平均機率：CV {float(final['w']['oof'][all_sel].mean()):.3f}、"
+             f"test {float(np.mean(final['w']['test'])):.3f}",
+             *[f"- ⚠️ {lab} 的預測分佈在 CV 與 test 差很多（總變異距離 {shift[t][2]:.3f} > {SHIFT_WARN}）"
+               for t, lab in (("a", "action"), ("p", "point")) if shift[t][2] > SHIFT_WARN],
+             "",
              "配方：", "```json",
              json.dumps({**{t: [(n, round(w, 3)) for n, w in final[t]["recipe"]] for t in ("a", "p", "w")},
                          **{f"{t}_plain": [(n, round(w, 3)) for n, w in final[t]["recipe_plain"]]
