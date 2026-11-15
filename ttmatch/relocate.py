@@ -11,12 +11,17 @@ match / numberGame / rally_id 三個編號被打亂。也就是說，它們是�
 3. 比分夾在該局前一個與後一個已知 rally 之間（雙方得分都不能倒退）；
 4. 發球者符合該局的發球輪替（每 2 分換發，10 平後每分換發）；
 5. 這個比分下該局還沒結束。
-只用上面 5 個條件就能唯一定位的 rally 有很強的位置規律：幾乎都在「前一個公開 rally 的後 2 分」
-（126 個裡有 124 個）。因此再加第 6 個條件：
-6. rally_id 必須等於該局前一個公開 rally 的 rally_id + 2。
-6 個條件都滿足的候選只剩一個才放回去；放回去的 rally 成為新的已知點（收緊條件 2、3），再反覆處理其餘的
-rally。定位不出來的維持原狀（之後仍當作沒有比分推移資訊）。在 train 上模擬同樣的公開 / 打散樣式，
-放回去的 rally 約 99% 位置正確。
+只用上面 5 個條件就能唯一定位的 rally 有很強的位置規律，所以再加兩個條件：
+6. rally_id 必須等於該局前一個公開 rally 的 rally_id + 2（只用條件 1–5 唯一定位的 126 個裡有 124 個如此）；
+7. 該局下一個公開 rally 必須剛好在後 2 分、而且這 2 分雙方各得 1 分；或者該局之後沒有公開的 rally。
+   只用條件 1–6 唯一定位的 183 個裡有 177 個如此，其中「下一個公開 rally 在後 2 分」的 95 個全部是各得 1 分，
+   沒有任何一個是同一方連得 2 分。正常的連續 rally 有 49% 是同一方連得 2 分（train），候選能不能唯一定位又與
+   這 2 分怎麼分無關，所以這是主辦單位挑選打散 rally 的方式，不是定位過程造成的。
+7 個條件都滿足的候選只剩一個才放回去；放回去的 rally 成為新的已知點（收緊條件 2、3），再反覆處理其餘的
+rally。定位不出來的維持原狀（之後仍當作沒有比分推移資訊）。只滿足條件 1–6 的 7 個 rally 不放：放錯會讓
+它自己與前一個公開 rally 都拿到錯的比分推移，比不放的損失大。
+
+`python tools/relocation_sim.py` 在 train 上模擬同樣的公開 / 打散樣式，量各組條件放回的數量與正確率。
 
 用途：放回去之後，(1) 這些 rally 自己有了比分推移與同場 history 特徵；(2) 它們前面的公開 rally 多了一個
 更近的比分檢查點，比分推移的間隔從 4 縮短成 2。只用到 test 已公開的欄位（選手、比分），不涉及任何答案。
@@ -27,7 +32,8 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 
-REQUIRED_DPREV = 2   # 打散的 rally 與前一個公開 rally 的 rally_id 差（觀察到的規律，當作必要條件）
+REQUIRED_DPREV = 2   # 條件 6：打散的 rally 與前一個公開 rally 的 rally_id 差（觀察到的規律，當作必要條件）
+REQUIRED_DNEXT = 2   # 條件 7：與下一個公開 rally 的 rally_id 差（且這幾分雙方各得 1 分），或之後沒有公開 rally
 
 
 def _serve_turn(total: int) -> int:
@@ -93,10 +99,21 @@ class _Game:
         vis_prev = [i for i in sorted(self.visible) if i < rid]
         return (rid - vis_prev[-1] if vis_prev else None, nxt[0] - rid if nxt else None)
 
+    def next_visible_ok(self, rid, score):
+        """條件 7：下一個公開 rally 在後 REQUIRED_DNEXT 分且雙方各得 1 分，或該局之後沒有公開 rally。"""
+        vis_next = [i for i in sorted(self.visible) if i > rid]
+        if not vis_next:
+            return True
+        if vis_next[0] - rid != REQUIRED_DNEXT:
+            return False
+        other = self.points[vis_next[0]][1]
+        return all(other[p] - score[p] == 1 for p in score)
 
-def relocate_scrambled(test_df: pd.DataFrame, max_rounds: int = 20) -> pd.DataFrame:
-    """回傳能唯一定位的打散 rally：rally_uid, match, numberGame, rally_id（真實位置）。"""
-    heads = rally_heads(test_df)
+
+def relocate_heads(heads: pd.DataFrame, max_rounds: int = 20, use_next: bool = True) -> pd.DataFrame:
+    """relocate_scrambled 的主體，輸入是 rally_heads 的結果（模擬工具直接用這個介面）。
+
+    use_next=False 時不檢查條件 7（只用條件 1–6，對照用）。"""
     bad = scrambled_matches(heads)
     normal, scr = heads[~heads["match"].isin(bad)], heads[heads["match"].isin(bad)]
     games: dict[tuple, list[_Game]] = {}
@@ -122,7 +139,8 @@ def relocate_scrambled(test_df: pd.DataFrame, max_rounds: int = 20) -> pd.DataFr
             cands = []
             for gm in games.get((pair, int(r.sex)), []):
                 d = gm.fit(int(r.true_rid), int(r.server), score)
-                if d is not None and d[0] == REQUIRED_DPREV:
+                if (d is not None and d[0] == REQUIRED_DPREV
+                        and (not use_next or gm.next_visible_ok(int(r.true_rid), score))):
                     cands.append(gm)
             if len(cands) == 1:
                 picks[uid] = cands[0]
@@ -137,6 +155,11 @@ def relocate_scrambled(test_df: pd.DataFrame, max_rounds: int = 20) -> pd.DataFr
             placed[uid] = (gm.match, gm.game, int(r.true_rid))
     return pd.DataFrame([(u, m, g, rid) for u, (m, g, rid) in sorted(placed.items())],
                         columns=["rally_uid", "match", "numberGame", "rally_id"])
+
+
+def relocate_scrambled(test_df: pd.DataFrame, max_rounds: int = 20, use_next: bool = True) -> pd.DataFrame:
+    """回傳能唯一定位的打散 rally：rally_uid, match, numberGame, rally_id（真實位置）。"""
+    return relocate_heads(rally_heads(test_df), max_rounds, use_next)
 
 
 def apply_relocation(test_df: pd.DataFrame, placed: pd.DataFrame) -> pd.DataFrame:

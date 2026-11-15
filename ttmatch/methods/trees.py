@@ -185,6 +185,70 @@ def train_multiclass(kind, D, target_col, classes, n_folds=config.N_FOLDS, fast=
     return oof, test_pred
 
 
+def train_factored(kind, D, targets=("a", "p"), n_folds=config.N_FOLDS, fast=False, use_aug=True,
+                   aug_weight_mult=5.0, n_seeds=1, params=None, extra=(), drop=(), align=True):
+    """把「下一拍是不是終結拍」拆出來單獨建模，讓 test 內部轉移可以放心拿來訓練。回傳 {oof_a, te_a, oof_p, te_p}。
+
+    P(類別 | x) = P(終結 | x) · P(類別 | 終結, x) + (1 − P(終結 | x)) · P(類別 | 非終結, x)
+    - P(終結 | x)：二元模型，只用 train（test 沒有終結拍的標籤，也不能假設它的比例）。
+    - P(類別 | 非終結, x)：多類別模型，用 train 的非終結列 + test 內部轉移。test 內部轉移全部是非終結拍，
+      放進這個條件模型不會改變任何終結拍的比例，所以沒有本檔開頭說的偏差，又能用到 test 選手的資料。
+    - P(類別 | 終結, x)：落點一定是 0；球種另訓練一個只用 train 終結列的多類別模型。
+    """
+    _X = lambda df: get_X(df, list(extra)).drop(columns=list(drop))
+    base_df, test_df = D["ap_base"], D["test_pred"]
+    aug_df = D["ap_aug"] if use_aug else None
+    term = base_df["is_terminal"].to_numpy().astype(int)
+    w_al = base_df["align_w"].to_numpy() if align else np.ones(len(base_df))
+    w_aug = (aug_df["align_w"].to_numpy() if align else np.ones(len(aug_df))) if aug_df is not None else None
+    X_base, X_test = _X(base_df).reset_index(drop=True), _X(test_df).reset_index(drop=True)
+    X_aug = _X(aug_df).reset_index(drop=True) if aug_df is not None else None
+    specs = {"a": ("next_action", config.ACTION_CLASSES), "p": ("next_point", config.POINT_CLASSES)}
+    out = {}
+    for t in targets:
+        out[f"oof_{t}"] = np.zeros((len(base_df), len(specs[t][1])))
+        out[f"te_{t}"] = np.zeros((len(test_df), len(specs[t][1])))
+
+    def _multiclass(rows_tr, rows_va, y, classes, with_aug, ya, X_va, seeds_kw):
+        """在 rows_tr（可加 aug 列）上訓練多類別模型，回傳對 X_va 與 test 的機率。"""
+        c2i = {c: i for i, c in enumerate(classes)}
+        C = len(classes)
+        rows_tr = rows_tr[np.isin(y[rows_tr], classes)]
+        X_tr, y_tr, w_tr = X_base.iloc[rows_tr], np.array([c2i[v] for v in y[rows_tr]]), w_al[rows_tr].copy()
+        if with_aug:
+            ma = np.where(np.isin(ya, classes))[0]
+            X_tr = pd.concat([X_tr, X_aug.iloc[ma]], ignore_index=True)
+            y_tr = np.concatenate([y_tr, [c2i[v] for v in ya[ma]]])
+            w_tr = np.concatenate([w_tr, aug_weight_mult * w_aug[ma]])
+        w_tr = w_tr * _sample_weights(y_tr, C)
+        w_tr = w_tr / w_tr.mean()
+        rows_va = rows_va[np.isin(y[rows_va], classes)]
+        y_va = np.array([c2i[v] for v in y[rows_va]])
+        return _fit_predict(kind, C, X_tr, y_tr, w_tr, X_base.iloc[rows_va], y_va, [X_va, X_test], fast, **seeds_kw)
+
+    seeds_kw = dict(n_seeds=n_seeds, params_override=params)
+    for tr_idx, va_idx in get_folds(base_df["match"].to_numpy(), n_folds):
+        X_va = X_base.iloc[va_idx]
+        pt_va, pt_te = _fit_predict(kind, 2, X_base.iloc[tr_idx], term[tr_idx], w_al[tr_idx] / w_al[tr_idx].mean(),
+                                    X_va, term[va_idx], [X_va, X_test], fast, **seeds_kw)
+        nt_tr, nt_va = tr_idx[term[tr_idx] == 0], va_idx[term[va_idx] == 0]
+        t_tr, t_va = tr_idx[term[tr_idx] == 1], va_idx[term[va_idx] == 1]
+        for t in targets:
+            col, classes = specs[t]
+            y = base_df[col].astype(int).to_numpy()
+            ya = aug_df[col].astype(int).to_numpy() if aug_df is not None else None
+            n_va, n_te = _multiclass(nt_tr, nt_va, y, classes, aug_df is not None, ya, X_va, seeds_kw)
+            if t == "p":      # 終結拍的落點一定是 0
+                e_va, e_te = np.zeros_like(n_va), np.zeros_like(n_te)
+                e_va[:, classes.index(0)] = 1.0
+                e_te[:, classes.index(0)] = 1.0
+            else:
+                e_va, e_te = _multiclass(t_tr, t_va, y, classes, False, None, X_va, seeds_kw)
+            out[f"oof_{t}"][va_idx] = pt_va[:, None] * e_va + (1 - pt_va)[:, None] * n_va
+            out[f"te_{t}"] += (pt_te[:, None] * e_te + (1 - pt_te)[:, None] * n_te) / n_folds
+    return out
+
+
 def winner_extra(use_prog, extra=()):
     """winner 模型的額外特徵欄：use_prog 時加上 PROG_FEATURES，再接 extra；去重複並保留順序。
 
@@ -214,8 +278,15 @@ def train_winner(kind, D, n_folds=config.N_FOLDS, fast=False, use_prog=False, n_
 
 def run(kind, D, n_folds=config.N_FOLDS, fast=False, player_te=True, targets=("a", "p", "w"),
         use_prog=False, te_alpha=1.0, drop=(), mirror=False, mirror_weight=1.0, n_seeds=1,
-        params=None, extra=(), align=True, use_aug=False):
+        params=None, extra=(), align=True, use_aug=False, factored=False):
+    """factored：action / point 改用終結拍分解（train_factored）；此時 use_aug 指條件模型要不要加 test 內部轉移。"""
     out = {}
+    if factored:
+        assert not (player_te or mirror), "factored 不支援選手 TE 與鏡像"
+        ap = tuple(t for t in targets if t in ("a", "p"))
+        out.update(train_factored(kind, D, ap, n_folds, fast, use_aug=use_aug, n_seeds=n_seeds, params=params,
+                                  extra=extra, drop=drop, align=align))
+        targets = tuple(t for t in targets if t == "w")
     common = dict(drop=drop, mirror=mirror, mirror_weight=mirror_weight, n_seeds=n_seeds, params=params,
                   extra=extra, align=align, use_aug=use_aug)
     if "a" in targets:

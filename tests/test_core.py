@@ -134,9 +134,12 @@ def _fake_D(n_matches=8, rallies_per_match=30, seed=0):
     rows, uid = [], 0
     for m in range(n_matches):
         for _ in range(rallies_per_match):
-            for t in range(1, int(rng.integers(1, 5)) + 1):
+            n = int(rng.integers(1, 5))
+            win = int(rng.integers(0, 2))
+            for t in range(1, n + 1):
                 rows.append(dict(rally_uid=uid, match=m, prefix_len=t, next_action=int(rng.integers(0, 15)),
-                                 next_point=int(rng.integers(0, 10)), winner=int(rng.integers(0, 2))))
+                                 next_point=int(rng.integers(0, 10)), winner=win,
+                                 is_terminal=int(t == n), align_w=1.0))
             uid += 1
     g = np.concatenate([[0.0], np.ones(30) / 30])     # 截斷位置分佈（均勻）
     return dict(ap_base=pd.DataFrame(rows), cut_g=g)
@@ -172,12 +175,63 @@ def test_nested_estimate_returns_scores():
     ev = Evaluator(D, repeats=2)
     rng = np.random.default_rng(2)
     n = len(D["ap_base"])
-    oof = {"m1": rng.dirichlet(np.ones(10), n), "m2": rng.dirichlet(np.ones(10), n)}
-    b, s = nested_estimate(ev, list(oof), oof, "p")
-    assert 0.0 <= b <= 1.0 and 0.0 <= s <= 1.0
-    w = {"m1": rng.random(n), "m2": rng.random(n)}
-    b, s = nested_estimate(ev, list(w), w, "w")
-    assert 0.0 <= b <= 1.0 and 0.0 <= s <= 1.0
+    methods = {name: dict(oof_a=rng.dirichlet(np.ones(15), n), oof_p=rng.dirichlet(np.ones(10), n),
+                          oof_w=rng.random(n), uses_prog=np.array(prog))
+               for name, prog in (("m1", False), ("m2", True), ("m3", False))}
+    for terminal in (True, False):
+        res = nested_estimate(ev, methods, D["ap_base"], terminal=terminal)
+        assert set(res) == {"a", "p", "w"}
+        for t in res:      # (集成, 最佳單一方法, 不做終結拍更新的集成)
+            assert len(res[t]) == 3 and all(0.0 <= v <= 1.0 for v in res[t])
+        assert res["w"][0] == res["w"][2]
+        if not terminal:
+            assert res["a"][0] == res["a"][2] and res["p"][0] == res["p"][2]
+
+
+def test_terminal_update_moves_point0_with_winner():
+    from arena import terminal_update, fit_terminal_stats, striker_loses
+    # 前綴長度 1 → 要預測第 2 拍，由接發球方打；winner = 1（發球方得分）表示這一拍的擊球者輸
+    assert striker_loses([1, 2, 1, 2], [1, 1, 0, 0]).tolist() == [True, False, False, True]
+    base = pd.DataFrame(dict(
+        prefix_len=[1, 1, 1, 1, 2, 2], winner=[1, 1, 0, 1, 0, 1], is_terminal=[1, 0, 0, 0, 1, 0],
+        next_action=[3, 5, 5, 5, 3, 5], align_w=[1.0, 1.0, 1.0, 2.0, 1.0, 1.0]))
+    st = fit_terminal_stats(base)
+    # k = 1 的非終結列：擊球者（接發球方）輸 ⇔ winner = 1 → 權重 (1 + 2) / (1 + 1 + 2)
+    assert abs(st["q"][1] - 0.75) < 1e-12 and abs(st["q"][2] - 0.0) < 1e-12
+    assert abs(st["pri_t"][3] - 1.0) < 1e-6 and abs(st["pri_n"][5] - 1.0) < 1e-6
+    p = np.array([[0.4, 0.3, 0.3] + [0.0] * 7] * 3)
+    a = np.full((3, 15), 1 / 15)
+    k = np.array([1, 1, 1])
+    prior_lose = 0.4 + 0.6 * 0.75                                   # 模型隱含的 P(擊球者輸)
+    pw = np.array([prior_lose, 1e-9, 1 - 1e-9])                     # 接發球方打：P(擊球者輸) = P(發球方得分)
+    a2, p2 = terminal_update(p, a, pw, k, st, lam=1.0)
+    assert np.allclose(p2[0], p[0]) and np.allclose(a2[0], a[0])    # winner 與模型隱含的一致 → 不變
+    assert p2[1, 0] < 1e-3 and abs(p2[1, 1] - 0.5) < 1e-3           # 擊球者一定贏 → 不是終結拍，其餘類別等比例放大
+    assert abs(p2[2, 0] - 0.4 / prior_lose) < 1e-3                  # 擊球者一定輸 → P(終結 | 輸)
+    assert np.allclose(p2.sum(1), 1) and np.allclose(a2.sum(1), 1)
+    assert a2[2, 3] > a[2, 3] > a2[1, 3]                            # 球種 3 只出現在終結拍
+    # lam = 0 → 完全不動
+    a0, p0 = terminal_update(p, a, pw, k, st, lam=0.0)
+    assert np.allclose(p0, p) and np.allclose(a0, a)
+
+
+def test_select_terminal_update_keeps_blend_without_gain():
+    from arena import Evaluator, select_terminal_update, fit_terminal_stats
+    D = _fake_D()
+    ev = Evaluator(D, repeats=2)
+    base = D["ap_base"]
+    rng = np.random.default_rng(5)
+    n = len(base)
+    k = base["prefix_len"].to_numpy()
+    y = base["next_point"].to_numpy()
+    # 落點機率已經是完美答案 → 任何更新都不會進步，不採用
+    perfect = np.full((n, 10), 1e-3)
+    perfect[np.arange(n), y] = 1.0
+    perfect /= perfect.sum(1, keepdims=True)
+    bl = dict(a=rng.dirichlet(np.ones(15), n), p=perfect, w=rng.random(n))
+    log = []
+    out = select_terminal_update(ev, bl, bl, k, k, fit_terminal_stats(base), log)
+    assert "p" not in out and any("不採用" in line for line in log)
 
 
 def test_match_history_uses_only_earlier_rallies():
@@ -297,38 +351,76 @@ def _stroke(uid, match, game, rid, server, receiver, ss, so, sex=1):
 def test_relocate_scrambled_puts_hidden_rally_back():
     from ttmatch.relocate import relocate_scrambled, apply_relocation, scrambled_matches, rally_heads
     rows = [
-        # match 1 第 1 局（選手 1 先發）：公開 rally 1（0-0）、4（選手 1 兩分、選手 2 一分）、7（4-2）
-        _stroke(1, 1, 1, 1, 1, 2, 0, 0), _stroke(2, 1, 1, 4, 2, 1, 1, 2), _stroke(3, 1, 1, 7, 2, 1, 2, 4),
-        # match 1 第 2 局（選手 2 先發）：同一個比分在這局的發球者不同，不能放這裡
+        # match 1 第 1 局（選手 1 先發）：公開 rally 1（0-0）、5（2-2）、8（選手 2 發球，3-4）
+        _stroke(1, 1, 1, 1, 1, 2, 0, 0), _stroke(2, 1, 1, 5, 1, 2, 2, 2), _stroke(3, 1, 1, 8, 2, 1, 3, 4),
+        # match 1 第 2 局（選手 2 先發）：同一個比分在這局的發球者不同
         _stroke(4, 1, 2, 1, 2, 1, 0, 0), _stroke(5, 1, 2, 5, 2, 1, 2, 2),
-        # match 2：另一對選手
-        _stroke(6, 2, 1, 1, 3, 4, 0, 0), _stroke(7, 2, 1, 4, 4, 3, 2, 1),
+        # match 2：另一對選手；rally 3 到 rally 5 之間選手 3 連得 2 分
+        _stroke(6, 2, 1, 1, 3, 4, 0, 0), _stroke(7, 2, 1, 5, 3, 4, 3, 1),
         # 打散的「match 900」：編號是假的
         _stroke(8, 900, 3, 9, 2, 1, 1, 1),     # 真實位置：match 1 第 1 局 rally 3（1-1，選手 2 發球）
         _stroke(9, 900, 3, 8, 2, 1, 9, 9),     # 9-9 是 rally 19，離前一個公開 rally 太遠（不是 +2）→ 不放
-        _stroke(11, 900, 1, 2, 1, 2, 5, 0),    # 5-0 是 rally 6：夾在 rally 4（2-1）與 7（4-2）之間但得分倒退 → 不放
+        _stroke(11, 900, 1, 2, 1, 2, 5, 0),    # 5-0 是 rally 6：夾在 rally 5（2-2）與 8 之間但得分倒退 → 不放
         _stroke(10, 900, 2, 7, 5, 6, 3, 3),    # 這對選手沒有正常的比賽 → 不放
+        _stroke(12, 900, 2, 12, 4, 3, 1, 1),   # match 2 rally 3：下一個公開 rally 在後 2 分但同一方連得 2 分 → 不放
+        _stroke(13, 900, 1, 20, 1, 2, 3, 3),   # match 1 第 2 局 rally 7：前一個公開 rally 在前 2 分、之後沒有公開 rally
     ]
     df = pd.DataFrame(rows)
     assert scrambled_matches(rally_heads(df)) == {900}
     placed = relocate_scrambled(df)
-    assert placed.to_dict("records") == [dict(rally_uid=8, match=1, numberGame=1, rally_id=3)]
+    assert placed.to_dict("records") == [dict(rally_uid=8, match=1, numberGame=1, rally_id=3),
+                                         dict(rally_uid=13, match=1, numberGame=2, rally_id=7)]
+    # 不檢查條件 7 時，rally 12 也會被放回去
+    loose = relocate_scrambled(df, use_next=False)
+    assert loose["rally_uid"].tolist() == [8, 12, 13]
     out = apply_relocation(df, placed).set_index("rally_uid")
     assert tuple(out.loc[8, ["match", "numberGame", "rally_id"]]) == (1, 1, 3)
     assert tuple(out.loc[9, ["match", "numberGame", "rally_id"]]) == (900, 3, 8)   # 沒定位的列不動
-    assert out.drop(index=8).equals(df.set_index("rally_uid").drop(index=8))
+    assert out.drop(index=[8, 13]).equals(df.set_index("rally_uid").drop(index=[8, 13]))
 
 
 def test_relocate_refuses_ambiguous_placement():
     from ttmatch.relocate import relocate_scrambled
     rows = [
         # 同一對選手的兩場比賽，第 1 局的已知 rally 完全相同 → 打散的 rally 兩邊都放得進去
-        _stroke(1, 1, 1, 1, 1, 2, 0, 0), _stroke(2, 1, 1, 4, 2, 1, 1, 2),
-        _stroke(3, 2, 1, 1, 1, 2, 0, 0), _stroke(4, 2, 1, 4, 2, 1, 1, 2),
+        _stroke(1, 1, 1, 1, 1, 2, 0, 0), _stroke(2, 1, 1, 5, 1, 2, 2, 2),
+        _stroke(3, 2, 1, 1, 1, 2, 0, 0), _stroke(4, 2, 1, 5, 1, 2, 2, 2),
         _stroke(5, 900, 3, 9, 2, 1, 1, 1),
     ]
-    assert relocate_scrambled(pd.DataFrame(rows)).empty
+    df = pd.DataFrame(rows)
+    assert relocate_scrambled(df).empty
+    # 拿掉其中一場就能唯一定位
+    assert relocate_scrambled(df[df["match"] != 2])["rally_uid"].tolist() == [5]
 
+
+def test_relocation_sim_recovers_true_positions():
+    """模擬工具：在完整的比賽上照 test 的樣式打散再放回，放回的位置要與真實位置一致。"""
+    from tools.relocation_sim import simulate, _eligible
+    from ttmatch.relocate import relocate_heads, rally_heads
+    from types import SimpleNamespace as R
+    a = R(rally_id=1, server=1, receiver=2, srv_score=0, rcv_score=0)
+    b = R(rally_id=3, server=2, receiver=1, srv_score=1, rcv_score=1)
+    c = R(rally_id=5, server=1, receiver=2, srv_score=2, rcv_score=2)
+    d = R(rally_id=5, server=1, receiver=2, srv_score=3, rcv_score=1)
+    assert _eligible(a, b, c) and _eligible(a, b, None)
+    assert not _eligible(a, b, d) and not _eligible(None, b, c)
+    # 兩場比賽（不同的選手組合）各一局 12 分，雙方輪流得分
+    rows, uid = [], 0
+    for m, (p1, p2) in enumerate([(1, 2), (3, 4)], start=1):
+        score = {p1: 0, p2: 0}
+        for rid in range(1, 13):
+            server = p1 if ((rid - 1) // 2) % 2 == 0 else p2
+            other = p2 if server == p1 else p1
+            rows.append(_stroke(uid, m, 1, rid, server, other, score[server], score[other]))
+            score[p1 if rid % 2 else p2] += 1
+            uid += 1
+    heads = rally_heads(pd.DataFrame(rows))
+    pat = dict(first={1: 1}, steps={2: 1}, rate=1.0, n_matches=2)
+    sim, truth = simulate(heads, pat, np.random.default_rng(0))
+    assert len(truth) == 6                       # 每局 rally 1, 3, ..., 11 被選中，其中 3、7、11 被打散
+    placed = relocate_heads(sim)
+    got = {int(u): (m, g, int(r)) for u, m, g, r in placed.itertuples(index=False)}
+    assert got == truth
 
 
 def test_presets_match_method_registry():
@@ -341,6 +433,14 @@ def test_presets_match_method_registry():
     for name in FINAL_METHODS:
         assert METHODS[name][1].uses_prog == (name in PROG_METHODS), name
     assert not any(METHODS[n][1].uses_prog for n in NOPROG_METHODS)
+
+
+def test_control_methods_stay_out_of_presets():
+    """對照用的方法（樹模型直接併入 test 內部轉移）不能出現在最終方法集裡。"""
+    from arena import CONTROL_METHODS, FINAL_METHODS
+    from run_method import METHODS
+    assert CONTROL_METHODS <= METHODS.keys()
+    assert not CONTROL_METHODS & set(FINAL_METHODS)
 
 
 def test_prediction_shift_measures_distribution_gap():
