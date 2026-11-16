@@ -4,27 +4,17 @@
   0000workjason/aicup2026-tabletennis-prediction（私榜第 3 名）solution/model_lgbm.py
 - XGBoost / CatBoost 對照組參考 lucas6028/AI_CUP_2026_Table_Tennis_Prediction（前標）的多樹模型比較
 - winner 模型可加入本 repo 新增的比分推移特徵（PROG_FEATURES）
-
-test 內部轉移擴充（use_aug）預設關閉。這些列來自 test rally 自己較短的前綴，而且一定不是 rally 的最後一拍；
-樹模型會記住「這個 rally / 這位選手的列都不是終結拍」，於是對同一個 rally 真正要預測的那一列幾乎不預測
-落點 0：LightGBM + history 在 test 上的平均 P(落點 0) 只有 0.07，OOF 是 0.41；拿掉這些列後 test 是 0.40。
-CV 看不到這個偏差（驗證 fold 的 rally 沒有自己的前綴在訓練集裡）。序列模型沒有這個現象，仍使用這些列。
 """
 from __future__ import annotations
-import os
-
 import numpy as np
 import pandas as pd
 
 from .. import config
 from ..cv import get_folds
-from ..features import (CATEGORICAL, CATEGORICAL_OPTIONAL, PROG_FEATURES, get_X,
+from ..features import (CATEGORICAL, PROG_FEATURES, get_X,
                         fit_target_encoding, apply_target_encoding, oof_target_encoding)
-from ..truncation import blend_aug_weights
 
 ACTION_TE_KEYS = [["next_player"], ["next_player", "last_action"], ["next_player", "next_strikeId"]]
-# 同時跑多個訓練行程時用來限制每個行程的執行緒數（CatBoost 預設會佔滿所有核心）；0 = 套件預設
-N_THREADS = int(os.environ.get("TTMATCH_THREADS", "0"))
 
 
 def _sample_weights(y_idx, n_class, temper=0.5):
@@ -44,30 +34,19 @@ def _with_te(X, src_df, encoders, classes, tag):
 
 # --- 各套件的 fit / predict 包裝 ---------------------------------------------
 
-def _fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast,
-                 n_seeds=1, params_override=None):
-    """n_seeds>1 時以不同隨機種子各訓練一次並平均（seed bagging）；params_override 覆寫套件預設參數。"""
-    if n_seeds > 1:
-        outs = [_fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast,
-                             1, {**(params_override or {}), "_seed": config.SEED + 1000 * s})
-                for s in range(n_seeds)]
-        return [np.mean([o[i] for o in outs], axis=0) for i in range(len(X_preds))]
-    po = dict(params_override or {})
-    seed = int(po.pop("_seed", config.SEED))
-    rounds = 120 if fast else int(po.pop("rounds", 1500))
-
+def _fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast):
+    rounds = 120 if fast else 1500
     if kind == "lgbm":
         import lightgbm as lgb
         params = dict(learning_rate=0.05, num_leaves=63 if n_class > 2 else 47,
                       min_data_in_leaf=40 if n_class > 2 else 60,
                       feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
-                      lambda_l2=1.0, num_threads=N_THREADS, verbosity=-1, seed=seed)
-        params.update(po)
+                      lambda_l2=1.0, num_threads=0, verbosity=-1, seed=config.SEED)
         if n_class > 2:
             params.update(objective="multiclass", num_class=n_class, metric="multi_logloss")
         else:
             params.update(objective="binary", metric="auc")
-        cats = [c for c in CATEGORICAL + CATEGORICAL_OPTIONAL if c in X_tr.columns]
+        cats = [c for c in CATEGORICAL if c in X_tr.columns]
         dtr = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, categorical_feature=cats, free_raw_data=False)
         dva = lgb.Dataset(X_va, label=y_va, categorical_feature=cats, reference=dtr)
         m = lgb.train(params, dtr, num_boost_round=rounds, valid_sets=[dva],
@@ -78,8 +57,7 @@ def _fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast,
         import xgboost as xgb
         params = dict(tree_method="hist", learning_rate=0.06, max_depth=7, subsample=0.8,
                       colsample_bytree=0.8, min_child_weight=3, reg_lambda=1.0,
-                      nthread=N_THREADS, seed=seed)
-        params.update(po)
+                      nthread=0, seed=config.SEED)
         if n_class > 2:
             params.update(objective="multi:softprob", num_class=n_class, eval_metric="mlogloss")
         else:
@@ -93,17 +71,15 @@ def _fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast,
 
     if kind == "cat":
         from catboost import CatBoostClassifier
-        cats = [c for c in CATEGORICAL + CATEGORICAL_OPTIONAL if c in X_tr.columns]
+        cats = [c for c in CATEGORICAL if c in X_tr.columns]
         # 多類別 + 大量類別特徵時 CTR 計算很慢：限制 CTR 組合、小詞彙類別改 one-hot
-        cat_params = dict(
+        m = CatBoostClassifier(
             iterations=150 if fast else 700, learning_rate=0.12, depth=6,
             max_ctr_complexity=1, one_hot_max_size=20,
             loss_function="MultiClass" if n_class > 2 else "Logloss",
             eval_metric="MultiClass" if n_class > 2 else "AUC",
-            random_seed=seed, thread_count=N_THREADS or -1, verbose=False,
+            random_seed=config.SEED, thread_count=-1, verbose=False,
             od_type="Iter", od_wait=60, allow_writing_files=False)
-        cat_params.update(po)
-        m = CatBoostClassifier(**cat_params)
         m.fit(X_tr, y_tr, sample_weight=w_tr, cat_features=cats, eval_set=(X_va, y_va))
         out = [m.predict_proba(X) for X in X_preds]
         return out if n_class > 2 else [p[:, 1] for p in out]
@@ -112,24 +88,11 @@ def _fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast,
 
 
 def train_multiclass(kind, D, target_col, classes, n_folds=config.N_FOLDS, fast=False,
-                     te_keys=None, te_alpha=1.0, aug_weight_mult=5.0, use_aug=False, drop=(),
-                     mirror=False, mirror_weight=1.0, n_seeds=1, params=None, extra=(), align=True):
-    """回傳 (oof, test_pred)，欄位順序 = classes。
-
-    align：訓練列依 test 的截斷機制加權（ap_base["align_w"]，見 ttmatch/truncation.py），讓訓練分佈的
-    前綴長度與終結拍比例對齊 test；aug 列併入時維持各前綴長度的終結拍比例。
-    use_aug：把 test 內部轉移（D["ap_aug"]）併入訓練。預設關閉，原因見本檔開頭；只有重現第 3 名原作法的
-    `lgbm` 與對照用的 `lgbm_hist_aug` 會打開。
-
-    drop：要拿掉的特徵欄。extra：額外加入的特徵欄（例如 cur_player、HIST_FEATURES）。
-    mirror：把訓練 fold 的左右鏡像列也加進訓練（標籤為 next_point 時一併鏡像），驗證 / test 永遠用原始列；
-    鏡像表沒有 extra 欄位，不能與 extra 同時使用。n_seeds：seed bagging。params：覆寫套件參數。
-    """
-    assert not (mirror and extra), "mirror 與 extra 不能同時使用"
-    _X = lambda df: get_X(df, list(extra)).drop(columns=list(drop))
+                     te_keys=None, te_alpha=1.0, aug_weight_mult=5.0, use_aug=True, drop=()):
+    """回傳 (oof, test_pred)，欄位順序 = classes。drop：要拿掉的特徵欄。"""
+    _X = lambda df: get_X(df).drop(columns=list(drop))
     base_df, test_df = D["ap_base"], D["test_pred"]
     aug_df = D["ap_aug"] if use_aug else None
-    mir_df = D["ap_base_mirror"] if mirror else None
     C = len(classes)
     c2i = {c: i for i, c in enumerate(classes)}
     yb = base_df[target_col].astype(int).to_numpy()
@@ -142,12 +105,6 @@ def train_multiclass(kind, D, target_col, classes, n_folds=config.N_FOLDS, fast=
         src_tr = base_df.iloc[rows]
         y_tr = np.array([c2i[v] for v in yb[rows]])
         n_base = len(y_tr)
-        n_mirror = 0
-        if mir_df is not None:
-            ym = mir_df[target_col].astype(int).to_numpy()[rows]  # 鏡像表與 base 一一對齊
-            src_tr = pd.concat([src_tr, mir_df.iloc[rows]], ignore_index=True)
-            y_tr = np.concatenate([y_tr, [c2i[v] for v in ym]])
-            n_mirror = len(rows)
         if aug_df is not None:
             ma = np.isin(ya, classes)
             src_tr = pd.concat([src_tr, aug_df.iloc[np.where(ma)[0]]], ignore_index=True)
@@ -163,141 +120,40 @@ def train_multiclass(kind, D, target_col, classes, n_folds=config.N_FOLDS, fast=
         X_va = _with_te(_X(va_df), va_df, encoders, classes, "te")
         X_te = _with_te(_X(test_df), test_df, encoders, classes, "te")
         w_tr = _sample_weights(y_tr, C)
-        w_tr[n_base:n_base + n_mirror] *= mirror_weight
-        w_tr[n_base + n_mirror:] *= aug_weight_mult
-        if align:
-            b = base_df.iloc[rows]
-            wb = b["align_w"].to_numpy()
-            if aug_df is not None:
-                a = aug_df.iloc[np.where(ma)[0]]
-                wb, wa = blend_aug_weights(wb, b["prefix_len"].to_numpy(), b["is_terminal"].to_numpy(),
-                                           aug_weight_mult * a["align_w"].to_numpy(), a["prefix_len"].to_numpy())
-                wa = wa / aug_weight_mult      # aug_weight_mult 已乘在 w_tr 上，這裡只留對齊的部分
-            else:
-                wa = np.zeros(0)
-            w_al = np.concatenate([wb, np.tile(wb, 1 if n_mirror else 0), wa])
-            w_tr = w_tr * w_al / np.average(w_al, weights=w_tr)
+        w_tr[n_base:] *= aug_weight_mult
         y_va = np.array([c2i.get(v, 0) for v in yb[va_idx]])
-        p_va, p_te = _fit_predict(kind, C, X_tr, y_tr, w_tr, X_va, y_va, [X_va, X_te], fast,
-                                  n_seeds=n_seeds, params_override=params)
+        p_va, p_te = _fit_predict(kind, C, X_tr, y_tr, w_tr, X_va, y_va, [X_va, X_te], fast)
         oof[va_idx] = p_va
         test_pred += p_te / n_folds
     return oof, test_pred
 
 
-def train_factored(kind, D, targets=("a", "p"), n_folds=config.N_FOLDS, fast=False, use_aug=True,
-                   aug_weight_mult=5.0, n_seeds=1, params=None, extra=(), drop=(), align=True):
-    """把「下一拍是不是終結拍」拆出來單獨建模，讓 test 內部轉移可以放心拿來訓練。回傳 {oof_a, te_a, oof_p, te_p}。
-
-    P(類別 | x) = P(終結 | x) · P(類別 | 終結, x) + (1 − P(終結 | x)) · P(類別 | 非終結, x)
-    - P(終結 | x)：二元模型，只用 train（test 沒有終結拍的標籤，也不能假設它的比例）。
-    - P(類別 | 非終結, x)：多類別模型，用 train 的非終結列 + test 內部轉移。test 內部轉移全部是非終結拍，
-      放進這個條件模型不會改變任何終結拍的比例，所以沒有本檔開頭說的偏差，又能用到 test 選手的資料。
-    - P(類別 | 終結, x)：落點一定是 0；球種另訓練一個只用 train 終結列的多類別模型。
-    """
-    _X = lambda df: get_X(df, list(extra)).drop(columns=list(drop))
+def train_winner(kind, D, n_folds=config.N_FOLDS, fast=False, use_prog=False):
     base_df, test_df = D["ap_base"], D["test_pred"]
-    aug_df = D["ap_aug"] if use_aug else None
-    term = base_df["is_terminal"].to_numpy().astype(int)
-    w_al = base_df["align_w"].to_numpy() if align else np.ones(len(base_df))
-    w_aug = (aug_df["align_w"].to_numpy() if align else np.ones(len(aug_df))) if aug_df is not None else None
-    X_base, X_test = _X(base_df).reset_index(drop=True), _X(test_df).reset_index(drop=True)
-    X_aug = _X(aug_df).reset_index(drop=True) if aug_df is not None else None
-    specs = {"a": ("next_action", config.ACTION_CLASSES), "p": ("next_point", config.POINT_CLASSES)}
-    out = {}
-    for t in targets:
-        out[f"oof_{t}"] = np.zeros((len(base_df), len(specs[t][1])))
-        out[f"te_{t}"] = np.zeros((len(test_df), len(specs[t][1])))
-
-    def _multiclass(rows_tr, rows_va, y, classes, with_aug, ya, X_va, seeds_kw):
-        """在 rows_tr（可加 aug 列）上訓練多類別模型，回傳對 X_va 與 test 的機率。"""
-        c2i = {c: i for i, c in enumerate(classes)}
-        C = len(classes)
-        rows_tr = rows_tr[np.isin(y[rows_tr], classes)]
-        X_tr, y_tr, w_tr = X_base.iloc[rows_tr], np.array([c2i[v] for v in y[rows_tr]]), w_al[rows_tr].copy()
-        if with_aug:
-            ma = np.where(np.isin(ya, classes))[0]
-            X_tr = pd.concat([X_tr, X_aug.iloc[ma]], ignore_index=True)
-            y_tr = np.concatenate([y_tr, [c2i[v] for v in ya[ma]]])
-            w_tr = np.concatenate([w_tr, aug_weight_mult * w_aug[ma]])
-        w_tr = w_tr * _sample_weights(y_tr, C)
-        w_tr = w_tr / w_tr.mean()
-        rows_va = rows_va[np.isin(y[rows_va], classes)]
-        y_va = np.array([c2i[v] for v in y[rows_va]])
-        return _fit_predict(kind, C, X_tr, y_tr, w_tr, X_base.iloc[rows_va], y_va, [X_va, X_test], fast, **seeds_kw)
-
-    seeds_kw = dict(n_seeds=n_seeds, params_override=params)
-    for tr_idx, va_idx in get_folds(base_df["match"].to_numpy(), n_folds):
-        X_va = X_base.iloc[va_idx]
-        pt_va, pt_te = _fit_predict(kind, 2, X_base.iloc[tr_idx], term[tr_idx], w_al[tr_idx] / w_al[tr_idx].mean(),
-                                    X_va, term[va_idx], [X_va, X_test], fast, **seeds_kw)
-        nt_tr, nt_va = tr_idx[term[tr_idx] == 0], va_idx[term[va_idx] == 0]
-        t_tr, t_va = tr_idx[term[tr_idx] == 1], va_idx[term[va_idx] == 1]
-        for t in targets:
-            col, classes = specs[t]
-            y = base_df[col].astype(int).to_numpy()
-            ya = aug_df[col].astype(int).to_numpy() if aug_df is not None else None
-            n_va, n_te = _multiclass(nt_tr, nt_va, y, classes, aug_df is not None, ya, X_va, seeds_kw)
-            if t == "p":      # 終結拍的落點一定是 0
-                e_va, e_te = np.zeros_like(n_va), np.zeros_like(n_te)
-                e_va[:, classes.index(0)] = 1.0
-                e_te[:, classes.index(0)] = 1.0
-            else:
-                e_va, e_te = _multiclass(t_tr, t_va, y, classes, False, None, X_va, seeds_kw)
-            out[f"oof_{t}"][va_idx] = pt_va[:, None] * e_va + (1 - pt_va)[:, None] * n_va
-            out[f"te_{t}"] += (pt_te[:, None] * e_te + (1 - pt_te)[:, None] * n_te) / n_folds
-    return out
-
-
-def winner_extra(use_prog, extra=()):
-    """winner 模型的額外特徵欄：use_prog 時加上 PROG_FEATURES，再接 extra；去重複並保留順序。
-
-    目前的方法不會重疊（lgbm_hist_prog 等把比分推移放在 extra 的方法只訓練 action/point），這是防呆：
-    若之後有方法同時 use_prog=True 又在 extra 放比分推移欄，不去重複會產生重複欄名，部分套件會報錯。
-    """
-    return list(dict.fromkeys((list(PROG_FEATURES) if use_prog else []) + list(extra)))
-
-
-def train_winner(kind, D, n_folds=config.N_FOLDS, fast=False, use_prog=False, n_seeds=1, params=None,
-                 extra=(), align=True):
-    base_df, test_df = D["ap_base"], D["test_pred"]
-    extra = winner_extra(use_prog, extra)
+    extra = PROG_FEATURES if use_prog else None
     yb = base_df["winner"].astype(int).to_numpy()
     oof = np.zeros(len(base_df))
     test_pred = np.zeros(len(test_df))
     X_all, X_te = get_X(base_df, extra), get_X(test_df, extra)
     for tr_idx, va_idx in get_folds(base_df["match"].to_numpy(), n_folds):
-        w_tr = base_df["align_w"].to_numpy()[tr_idx] if align else None
-        p_va, p_te = _fit_predict(kind, 2, X_all.iloc[tr_idx], yb[tr_idx], w_tr,
-                                  X_all.iloc[va_idx], yb[va_idx], [X_all.iloc[va_idx], X_te], fast,
-                                  n_seeds=n_seeds, params_override=params)
+        p_va, p_te = _fit_predict(kind, 2, X_all.iloc[tr_idx], yb[tr_idx], None,
+                                  X_all.iloc[va_idx], yb[va_idx], [X_all.iloc[va_idx], X_te], fast)
         oof[va_idx] = p_va
         test_pred += p_te / n_folds
     return oof, test_pred
 
 
 def run(kind, D, n_folds=config.N_FOLDS, fast=False, player_te=True, targets=("a", "p", "w"),
-        use_prog=False, te_alpha=1.0, drop=(), mirror=False, mirror_weight=1.0, n_seeds=1,
-        params=None, extra=(), align=True, use_aug=False, factored=False):
-    """factored：action / point 改用終結拍分解（train_factored）；此時 use_aug 指條件模型要不要加 test 內部轉移。"""
+        use_prog=False, te_alpha=1.0, drop=()):
     out = {}
-    if factored:
-        assert not (player_te or mirror), "factored 不支援選手 TE 與鏡像"
-        ap = tuple(t for t in targets if t in ("a", "p"))
-        out.update(train_factored(kind, D, ap, n_folds, fast, use_aug=use_aug, n_seeds=n_seeds, params=params,
-                                  extra=extra, drop=drop, align=align))
-        targets = tuple(t for t in targets if t == "w")
-    common = dict(drop=drop, mirror=mirror, mirror_weight=mirror_weight, n_seeds=n_seeds, params=params,
-                  extra=extra, align=align, use_aug=use_aug)
     if "a" in targets:
         out["oof_a"], out["te_a"] = train_multiclass(
             kind, D, "next_action", config.ACTION_CLASSES, n_folds, fast,
-            te_keys=ACTION_TE_KEYS if player_te else None, te_alpha=te_alpha, **common)
+            te_keys=ACTION_TE_KEYS if player_te else None, te_alpha=te_alpha, drop=drop)
     if "p" in targets:
         # 第 3 名的 A/B：選手 TE 對 point 反而 -0.004，因此 point 不加
         out["oof_p"], out["te_p"] = train_multiclass(
-            kind, D, "next_point", config.POINT_CLASSES, n_folds, fast, **common)
+            kind, D, "next_point", config.POINT_CLASSES, n_folds, fast, drop=drop)
     if "w" in targets:
-        out["oof_w"], out["te_w"] = train_winner(kind, D, n_folds, fast, use_prog,
-                                                 n_seeds=n_seeds, params=params, extra=extra, align=align)
+        out["oof_w"], out["te_w"] = train_winner(kind, D, n_folds, fast, use_prog)
     return out
