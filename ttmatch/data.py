@@ -12,9 +12,11 @@ import pandas as pd
 from . import config
 from .features import (add_features, test_gap_distribution, inconsistent_matches,
                        score_progression_train, score_progression_test, mirror_raw)
-from .history import match_history, attach_history, test_visible_rally_frac
+from .history import match_history, attach_history, test_visible_rally_frac, simulated_visible_sets
 from .relocate import relocate_scrambled, apply_relocation
 from .truncation import fit_cut_distribution, cut_weights
+
+N_SIM_SETS = 2    # 模擬成 test 可見樣式的組數（互不重疊；見 history.simulated_visible_sets）
 
 
 def load_raw():
@@ -62,14 +64,21 @@ def build_datasets(use_test_aug: bool = True, relocate: bool = True) -> dict:
     ap_base_mirror = _strip_serve_targets(add_features(mirror_raw(tr), has_winner=True))
     assert (ap_base_mirror["rally_uid"].to_numpy() == ap_base["rally_uid"].to_numpy()).all()
     assert (ap_base_mirror["prefix_len"].to_numpy() == ap_base["prefix_len"].to_numpy()).all()
+    # aug 列（內部轉移）一定不是終結拍：起始權重取同前綴長度的 base 非終結列平均權重
+    nt = ap_base[ap_base["is_terminal"] == 0]
+    k_cap = len(cut_g) - 1
+    nt_mean = nt["align_w"].groupby(nt["prefix_len"].clip(upper=k_cap)).mean()
+    aug_w = lambda k: k.clip(upper=k_cap).map(nt_mean).fillna(float(nt["align_w"].mean())).to_numpy()
     ap_aug = _strip_serve_targets(tef) if use_test_aug else None
     if ap_aug is not None:
-        # aug 列（test 內部轉移）一定不是終結拍：起始權重取同前綴長度的 base 非終結列平均權重
-        nt = ap_base[ap_base["is_terminal"] == 0]
-        k_cap = len(cut_g) - 1
-        nt_mean = nt["align_w"].groupby(nt["prefix_len"].clip(upper=k_cap)).mean()
-        ap_aug["align_w"] = (ap_aug["prefix_len"].clip(upper=k_cap).map(nt_mean)
-                             .fillna(float(nt["align_w"].mean())).to_numpy())
+        ap_aug["align_w"] = aug_w(ap_aug["prefix_len"])
+    # 把 train 的 match 模擬成 test 的可見樣式（vis_k0 與 history 特徵是同一組模擬）：樹模型的終結拍分解在
+    # 交叉驗證時，用驗證 match 的「模擬內部轉移」（prefix_len < vis_k 的列）重現 test 內部轉移的效果。
+    # vis_k* 與 sim_aug_w 都不是特徵（見 ttmatch/methods/trees.py 的 train_factored）
+    vis = simulated_visible_sets(tr, test_length_probs(tef), test_visible_rally_frac(te), N_SIM_SETS)
+    for c in vis.columns:
+        ap_base[c] = ap_base["rally_uid"].map(vis[c]).astype(int).to_numpy()
+    ap_base["sim_aug_w"] = aug_w(ap_base["prefix_len"])
     test_pred = tef[~tef["has_next"]].reset_index(drop=True).copy()
     # 異常 match 的 rally 沒有比分推移資訊，arena 對這些列改用不含比分推移的 winner 集成
     test_pred["prog_unreliable"] = test_pred["match"].isin(inconsistent_matches(te)).astype(int)

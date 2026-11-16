@@ -40,10 +40,12 @@ def test_visible_rally_frac(test_df: pd.DataFrame) -> float:
     return float(g["count"].sum() / g["max"].sum())
 
 
-def _visible_mask(df: pd.DataFrame, len_probs: dict | None, keep_prob: float | None, seed: int) -> np.ndarray:
-    """train 的模擬（見模組說明）。len_probs 與 keep_prob 都是 None 時（test）全部拍可見。"""
-    if len_probs is None and keep_prob is None:
-        return np.ones(len(df), dtype=bool)
+def visible_prefix_len(df: pd.DataFrame, len_probs: dict | None, keep_prob: float | None,
+                       seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """train 的模擬（見模組說明）：每個 rally 模擬成 test 時看得到前幾拍。
+
+    回傳 (rally_uid, k, inv)：k[i] 是第 i 個 rally 的可見前綴長度（0 或 −1 = 這個 rally 不可見），
+    inv 把 df 的每一列對到 rally。k 一定 ≤ rally 長度 − 1，所以可見的部分永遠不含 rally 的最後一拍。"""
     rng = np.random.default_rng(seed)
     uids = df["rally_uid"].to_numpy()
     uniq, inv = np.unique(uids, return_inverse=True)
@@ -66,7 +68,37 @@ def _visible_mask(df: pd.DataFrame, len_probs: dict | None, keep_prob: float | N
             assigned[pick] = True
         rest = kept[~assigned[kept]]
         k[rest] = rally_len[rest] - 1
-    return (k[inv] >= 1) & (sn <= k[inv])
+    return uniq, k, inv
+
+
+def _visible_mask(df: pd.DataFrame, len_probs: dict | None, keep_prob: float | None, seed: int) -> np.ndarray:
+    """哪些拍在模擬下可見。len_probs 與 keep_prob 都是 None 時（test）全部拍可見。"""
+    if len_probs is None and keep_prob is None:
+        return np.ones(len(df), dtype=bool)
+    _, k, inv = visible_prefix_len(df, len_probs, keep_prob, seed)
+    return (k[inv] >= 1) & (df["strikeNumber"].to_numpy() <= k[inv])
+
+
+def simulated_visible_sets(df: pd.DataFrame, len_probs: dict, keep_prob: float, n_sets: int = 2,
+                           seed: int = config.SEED) -> pd.DataFrame:
+    """把 train 模擬成 test 的可見樣式 n_sets 次，各次的可見 rally 互不重疊。回傳以 rally_uid 為索引的表，
+    欄 `vis_k0`..：這個 rally 在第 s 組模擬裡的可見前綴長度（0 = 這一組看不到它）。
+
+    第 0 組就是 history 特徵用的那一組（同一個 seed，見 match_history）。之後每一組只從「前面各組都看不到」
+    的 rally 裡抽，保留機率調成讓每一組佔全部 rally 的比例都是 keep_prob（剩下的 rally 不夠時全拿），
+    前綴長度的配對方式不變。用途見 ttmatch/methods/trees.py 的 train_factored（sim_aug）。"""
+    out = pd.DataFrame(index=pd.Index(pd.unique(df["rally_uid"]), name="rally_uid"))
+    taken = pd.Series(False, index=out.index)
+    for s in range(n_sets):
+        sub = df[~df["rally_uid"].map(taken).to_numpy()]
+        left = 1.0 - float(taken.mean())
+        col = pd.Series(0, index=out.index)
+        if len(sub) and left > 0:
+            uniq, k, _ = visible_prefix_len(sub, len_probs, min(1.0, keep_prob / left), seed + s)
+            col.loc[uniq] = np.maximum(k, 0)
+        out[f"vis_k{s}"] = col.to_numpy()
+        taken = taken | (col >= 1)
+    return out
 
 
 def match_history(df: pd.DataFrame, len_probs: dict | None = None, keep_prob: float | None = None,
