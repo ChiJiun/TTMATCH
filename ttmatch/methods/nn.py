@@ -15,9 +15,7 @@ import pandas as pd
 
 from .. import config
 from ..cv import get_folds
-from ..features import fit_target_encoding, POINT_MIRROR, POSITION_MIRROR, PROG_FEATURES  # noqa: F401
-from ..history import HIST_FEATURES, OHIST_FEATURES
-from ..truncation import blend_aug_weights
+from ..features import fit_target_encoding
 
 CAT_FEATS = ["actionId", "pointId", "handId", "strengthId", "spinId",
              "strikeId", "positionId", "sex"]
@@ -26,7 +24,11 @@ SCALAR_FEATS = ["score_diff", "total_points", "striker_is_server",
 SCALAR_DIV = np.array([11.0, 22.0, 1.0, 1.0, 1.0, 10.0], dtype=np.float32)
 POS_CAP = 40
 
-def _build_records(df: pd.DataFrame, scalar_feats=SCALAR_FEATS, scalar_div=SCALAR_DIV):
+POINT_MIRROR = np.array([0, 3, 2, 1, 6, 5, 4, 9, 8, 7])
+POSITION_MIRROR = np.array([0, 3, 2, 1])
+
+
+def _build_records(df: pd.DataFrame):
     df = df.sort_values(["rally_uid", "strikeNumber"])
     recs = []
     for uid, sub in df.groupby("rally_uid", sort=False):
@@ -34,7 +36,7 @@ def _build_records(df: pd.DataFrame, scalar_feats=SCALAR_FEATS, scalar_div=SCALA
         recs.append(dict(
             uid=int(uid), match=sub["match"].iloc[0],
             cats=sub[CAT_FEATS].to_numpy(dtype=np.int64),
-            scal=np.nan_to_num(sub[scalar_feats].to_numpy(dtype=np.float32) / scalar_div),  # prog 特徵可為 NaN
+            scal=(sub[SCALAR_FEATS].to_numpy(dtype=np.float32) / SCALAR_DIV),
             pos=np.clip(sub["strikeNumber"].to_numpy(dtype=np.int64), 0, POS_CAP),
             action=sub["actionId"].to_numpy(dtype=np.int64),
             point=sub["pointId"].to_numpy(dtype=np.int64),
@@ -59,7 +61,7 @@ def _mirror(rec):
 def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=16,
              fast=False, hidden=160, layers=2, dropout=0.3, lr=2e-3, weight_decay=1e-5,
              batch_size=128, n_seeds=2, seed=config.SEED, player_te=True, mirror=False,
-             player_emb=False, player_drop=0.15, hist=False, prog=False, align=False):
+             player_emb=False, player_drop=0.15):
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader
@@ -81,21 +83,11 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
         vocabs += [n_players, n_players]
         emb_dims += [16, 16]
         n_cat += 2
-    # hist=True：每一拍附上「下一拍擊球者在本場先前 rally 的傾向」（HIST_FEATURES；hist_n 以 50 正規化，其餘是比率）
-    # hist="both"：再加上目前擊球者（對手）的同一組統計（OHIST_FEATURES）
-    hist_feats = (HIST_FEATURES + OHIST_FEATURES) if hist == "both" else (HIST_FEATURES if hist else [])
-    hist_div = [50.0] + [1.0] * (len(HIST_FEATURES) - 1)
-    # prog=True：再加上比分推移特徵（揭露 rally 勝方；gap 與得分以 10 正規化，NaN 補 0）
-    prog_feats = PROG_FEATURES if prog else []
-    prog_div = {"prog_has_next": 1.0, "prog_gap": 10.0, "prog_srv_gain": 10.0, "prog_rcv_gain": 10.0, "prog_frac": 1.0}
-    scalar_feats = SCALAR_FEATS + hist_feats + prog_feats
-    scalar_div = np.concatenate([SCALAR_DIV, np.array(hist_div * (len(hist_feats) // len(HIST_FEATURES)), np.float32),
-                                 np.array([prog_div[c] for c in prog_feats], np.float32)])
-    n_scal_base = len(scalar_feats)
+    n_scal_base = len(SCALAR_FEATS)
     n_scal = n_scal_base + (config.N_ACTION if player_te else 0)
 
-    train_recs = _build_records(trf, scalar_feats, scalar_div)
-    test_recs = _build_records(tef, scalar_feats, scalar_div)
+    train_recs = _build_records(trf)
+    test_recs = _build_records(tef)
     train_match = np.array([r["match"] for r in train_recs])
 
     def _cls_w(y, n, temper=0.5):
@@ -108,21 +100,6 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
 
     ap_idx = {(u, t): i for i, (u, t) in
               enumerate(zip(ap_base["rally_uid"].to_numpy(), ap_base["prefix_len"].to_numpy()))}
-    if align:
-        # 每個位置的損失權重 = 截斷機制對齊權重（見 ttmatch/truncation.py）。train rally 的最後一個位置
-        # （整個 rally 都看完）在 test 不會出現，權重 0；test rally 的可見拍是非終結的 aug 列。
-        if ap_aug is not None:
-            w_base, w_aug = blend_aug_weights(ap_base["align_w"].to_numpy(), ap_base["prefix_len"].to_numpy(),
-                                              ap_base["is_terminal"].to_numpy(),
-                                              ap_aug["align_w"].to_numpy(), ap_aug["prefix_len"].to_numpy())
-            pos_w = {(u, t): w for u, t, w in zip(ap_aug["rally_uid"].to_numpy(),
-                                                  ap_aug["prefix_len"].to_numpy(), w_aug)}
-        else:
-            w_base, pos_w = ap_base["align_w"].to_numpy(), {}
-        pos_w.update({(u, t): w for u, t, w in zip(ap_base["rally_uid"].to_numpy(),
-                                                   ap_base["prefix_len"].to_numpy(), w_base)})
-        for r in train_recs + test_recs:
-            r["aw"] = np.array([pos_w.get((r["uid"], t), 0.0) for t in range(1, r["T"] + 1)], np.float32)
     te_idx = {u: i for i, u in enumerate(test_df["rally_uid"].to_numpy())}
     te_klen = dict(zip(test_df["rally_uid"].to_numpy(), test_df["prefix_len"].to_numpy().astype(int)))
 
@@ -153,11 +130,8 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
         tp = np.full((B, T), -100, np.int64)
         tw = np.zeros((B, T), np.float32)
         wmask = np.zeros((B, T), np.float32)
-        aw = np.ones((B, T), np.float32)
         for b, r in enumerate(batch):
             t = r["T"]
-            if align:
-                aw[b, :t] = r["aw"]
             if t > 1:
                 nxt_a = r["action"][1:t]
                 va = nxt_a <= 14
@@ -167,7 +141,7 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
                 tw[b, :t] = r["win"]
                 wmask[b, :t] = 1.0
         to = lambda a: torch.from_numpy(a).to(device)
-        return to(cats), to(scal), to(pos), to(ta), to(tp), to(tw), to(wmask), to(aw)
+        return to(cats), to(scal), to(pos), to(ta), to(tp), to(tw), to(wmask)
 
     class Embedder(nn.Module):
         def __init__(self):
@@ -259,12 +233,6 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
     ce_p = nn.CrossEntropyLoss(weight=wp, ignore_index=-100)
     bce = nn.BCEWithLogitsLoss(reduction="none")
 
-    def _wce(logits, target, cls_w, pw):
-        """位置加權的類別加權交叉熵：Σ pw·w_c·l / Σ pw·w_c（pw 全為 1 時等同 CrossEntropyLoss(weight)）。"""
-        loss = nn.functional.cross_entropy(logits, target, weight=cls_w, ignore_index=-100, reduction="none")
-        den = (pw * cls_w[target.clamp(min=0)] * (target != -100)).sum().clamp(min=1e-8)
-        return (loss * pw).sum() / den
-
     oof_a = np.zeros((len(ap_base), config.N_ACTION), np.float32)
     oof_p = np.zeros((len(ap_base), config.N_POINT), np.float32)
     oof_w = np.zeros(len(ap_base), np.float32)
@@ -345,19 +313,12 @@ def train_nn(D: dict, arch="gru", n_folds=config.N_FOLDS, device="cpu", epochs=1
             loader = DataLoader(tr_recs, batch_size=batch_size, shuffle=True, collate_fn=collate)
             for _ in range(epochs):
                 model.train()
-                for cats, scal, pos, ta, tp, tw, wmask, aw in loader:
+                for cats, scal, pos, ta, tp, tw, wmask in loader:
                     opt.zero_grad()
                     la, lp, lw = model(cats, scal, pos)
-                    if align:
-                        pw = aw.reshape(-1)
-                        loss = (config.W_ACTION * _wce(la.reshape(-1, config.N_ACTION), ta.reshape(-1), wa, pw)
-                                + config.W_POINT * _wce(lp.reshape(-1, config.N_POINT), tp.reshape(-1), wp, pw)
-                                + config.W_WINNER * (bce(lw, tw) * wmask * aw).sum()
-                                / (wmask * aw).sum().clamp(min=1e-8))
-                    else:
-                        loss = (config.W_ACTION * ce_a(la.reshape(-1, config.N_ACTION), ta.reshape(-1))
-                                + config.W_POINT * ce_p(lp.reshape(-1, config.N_POINT), tp.reshape(-1))
-                                + config.W_WINNER * (bce(lw, tw) * wmask).sum() / wmask.sum().clamp(min=1.0))
+                    loss = (config.W_ACTION * ce_a(la.reshape(-1, config.N_ACTION), ta.reshape(-1))
+                            + config.W_POINT * ce_p(lp.reshape(-1, config.N_POINT), tp.reshape(-1))
+                            + config.W_WINNER * (bce(lw, tw) * wmask).sum() / wmask.sum().clamp(min=1.0))
                     loss.backward()
                     opt.step()
                 sched.step()
