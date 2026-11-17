@@ -470,5 +470,10 @@ def test_nofa_preset_is_final_without_fa():
     """nofa 與 final 只差終結拍分解的樹模型，順序也相同（貪婪選擇的結果會跟候選順序有關）。"""
     from arena import FA_METHODS, PRESETS
     assert len(FA_METHODS) == 7 and all(m.endswith("_fa") for m in FA_METHODS)
-    assert PRESETS["nofa"] == [m for m in PRESETS["final"] if m not in FA_METHODS]
-    assert not any(m.endswith("_fa") for m in PRESETS["nofa"])
+    nofa, final = PRESETS["nofa"], PRESETS["final"]
+    assert len(nofa) == len(final) - 7
+    assert set(final) - set(nofa) == FA_METHODS and set(nofa) <= set(final)
+    assert not any(m.endswith("_fa") for m in nofa)
+    # 順序相同：nofa 是 final 的子序列
+    it = iter(final)
+    assert all(m in it for m in nofa)

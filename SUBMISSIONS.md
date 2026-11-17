@@ -3,7 +3,7 @@
 競賽：[Introduction to Data Science Competition — TTMATCH](https://www.kaggle.com/competitions/introduction-to-data-science-competition-ttmatch)，2026-11-16 約 23:59（台灣時間）截止。
 public 榜用 67% 的 test、private 榜用另外 33%。分數 = 0.4·action Macro-F1 + 0.4·point Macro-F1 + 0.2·winner AUC。
 
-**正式成績只有第 1 筆**。第 2、3 筆是截止後的 Late Submission，不計入排名，只用來對照，沒有拿來挑模型或調參。回合 3 不含 `_fa` 的版本（README 最後採用的）預定再上傳一次，之後不再上傳。
+**正式成績只有第 1 筆**。第 2、3 筆是截止後的 Late Submission，不計入排名，只用來對照 CV，沒有拿來調參。README 最後採用回合 3 不含 `_fa` 的版本，這個決定是在看過第 2、3 筆的分數之後依 CV 做的（理由與時間點見 README）。回合 3 不含 `_fa` 的版本（README 最後採用的）預定再上傳一次，之後不再上傳。
 
 | # | 上傳時間（台灣） | 計入成績 | 版本 | 檔案 md5 | CV 巢狀估計 | CV 的 test 預期 | public | private |
 |---|---|---|---|---|---:|---:|---:|---:|
@@ -36,9 +36,10 @@ Kaggle 的 submission ref：第 1 筆 57750635、第 2 筆 58437910、第 3 筆 
 | action | transformer 0.38、lgbm_note 0.26、gru_pemb 0.20、xgb 0.16 | 0.3971 |
 | point | lgbm 0.48、gru_mirror 0.32、gru_pemb 0.20 | 0.2023 |
 | winner | cat_prog 0.45、xgb 0.45、transformer 0.10 | 0.8462 |
+| winner（test 異常 match 340–354 的列） | 不含比分推移的集成：cat 0.384、xgb 0.256、lgbm 0.20、transformer 0.16 | 0.6959 |
 | **overall** | | **0.4090** |
 
-「方法競技場」的第一版：樹模型、GRU／Transformer、比分推移特徵、arena 貪婪集成；分深度決策與規則修正未採用。還沒有同場歷史特徵、截斷機制對齊、打散 rally 放回、終結拍相關的做法，test 異常 match（340–354）也還沒有改用不含比分推移的集成（那是 PR #3 才加的）。當時的 CV 是舊的評估方式（沒有對齊 test 的截斷機制），與第 2、3 筆的 CV 數字不能直接比較。
+「方法競技場」的第一版：樹模型、GRU／Transformer、比分推移特徵、arena 貪婪集成；分深度決策與規則修正未採用。還沒有同場歷史特徵、截斷機制對齊、打散 rally 放回、終結拍相關的做法。test 異常 match（340–354）的 winner 已經改用不含比分推移的集成（`e5e1e1b` 的 `arena.py` 第 204–213 行；配方見上表最後一列）；PR #3 補上的是 0.4055 這個 test 預期的估計，不是這個替換。當時的 CV 是舊的評估方式（沒有對齊 test 的截斷機制），與第 2、3 筆的 CV 數字不能直接比較。
 
 版本是這樣定位的（當時沒有記錄檔案雜湊）：
 - 上傳的檔名是 `submission.csv`，上傳時間 2026-10-28 22:59 UTC。

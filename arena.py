@@ -369,6 +369,7 @@ P0_WARN = 0.05
 # 「模型有多大把握」也單獨檢查（見 confidence）：test 減 CV 的差超過這個值就在報告裡標出來。
 # 不用 test 內部轉移的樹模型與序列模型，落點約 ±0.01、球種約 −0.02～−0.005；
 # 用了 test 內部轉移的樹模型（_fa）落點是 +0.02～+0.10：test 的每一列都有同場的內部轉移可學，CV 的驗證 fold 沒有。
+# 這個值是看過上面的數字才定的，離不用 test 內部轉移的樹模型（−0.022）不遠，只當提醒用。
 CONF_WARN = 0.03
 
 
@@ -657,7 +658,7 @@ def main():
                  f"{c[0]:.3f} | {c[1]:.3f} | {c[1] - c[0]:+.3f}" if c is not None else "— | — | —" for c in cells) + " |"
                for name, *cells in conf_rows],
              "",
-             *([f"- ⚠️ {', '.join(conf_flagged)} 在 test 上比 CV 更有把握（差 > {CONF_WARN}）：它在 test 上用到了"
+             *([f"- ⚠️ {', '.join(conf_flagged)} 在 test 上比 CV 更有把握（差 > {CONF_WARN}）：它在 test 上用到了 "
                 "CV 驗證 fold 沒有的資訊（例如同場的 test 內部轉移），CV 分數量不到這部分在 test 上的好處或壞處"]
                if conf_flagged else []),
              "",
