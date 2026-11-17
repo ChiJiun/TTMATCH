@@ -21,7 +21,8 @@
   python arena.py --no-override                           # 不嘗試規則修正
   python arena.py --no-nested                             # 跳過巢狀估計
   python arena.py --no-terminal-update                    # 不做終結拍更新（對照）
-  python arena.py --preset final                          # 只用 README 結果所用的方法集（FINAL_METHODS）
+  python arena.py --preset final                          # 改善回合 3 的方法集（FINAL_METHODS，含 _fa）
+  python arena.py --preset nofa --tag nofa                # 同上但不含 _fa（README 最後採用）→ outputs/submission_nofa.csv
 """
 from __future__ import annotations
 import argparse
@@ -74,7 +75,11 @@ PROG_METHODS = {"cat_prog", "cat_prog_bag3", "lgbm_prog", "xgb_prog", "cat_hist_
                 "lgbm_hist_prog", "xgb_hist2_prog", "transformer_hist2_prog_al",
                 "lgbm_hist_prog_fa", "xgb_hist2_prog_fa"}
 NOPROG_METHODS = [m for m in FINAL_METHODS if m not in PROG_METHODS]
-PRESETS = {"final": FINAL_METHODS, "noprog": NOPROG_METHODS, "r1": R1_METHODS}
+# 拿掉終結拍分解樹模型（`_fa`）的版本，README 最後採用的是這一個：`_fa` 在 test 上比 CV 更有把握（見 CONF_WARN），
+# 這部分 CV 量不到；而拿掉之後巢狀估計沒有變差。
+FA_METHODS = {m for m in FINAL_METHODS if m.endswith("_fa")}
+NOFA_METHODS = [m for m in FINAL_METHODS if m not in FA_METHODS]
+PRESETS = {"final": FINAL_METHODS, "nofa": NOFA_METHODS, "noprog": NOPROG_METHODS, "r1": R1_METHODS}
 BLEND_GRID = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
 MIN_GAIN = 5e-4
 # 對照用的方法：樹模型直接併入 test 內部轉移，test 上會低估終結拍（見 ttmatch/methods/trees.py）。
@@ -237,6 +242,7 @@ def terminal_update(p, a, pw, prefix_len, stats: dict, lam: float):
     lose = np.where((k + 1) % 2 == 1, 1 - pw, pw)
     p0 = np.clip(p[:, 0].astype(float), 1e-6, 1 - 1e-6)
     prior = p0 + (1 - p0) * stats["q"][np.minimum(k, TU_KCAP)]
+    # prior ≥ p0、lose ≤ 1，所以 λ ≤ 1 時更新後的機率不超過 p0^(1−λ) ≤ 1；clip 只是保險，不會真的截到
     post = np.clip(p0 * (lose / prior) ** lam, 0.0, 1.0)
     rest = p[:, 1:] / np.clip(p[:, 1:].sum(1, keepdims=True), 1e-12, None)
     p_new = np.concatenate([post[:, None], (1 - post)[:, None] * rest], axis=1)
@@ -360,6 +366,23 @@ SHIFT_WARN = 0.15
 # 終結拍另外單獨檢查：「預測為落點 0」的比例在 CV 與 test 的差超過這個值就警告。正常約 0.01–0.03；
 # 樹模型誤用 test 內部轉移時差 0.3 以上，但只混入一部分這種方法時總變異距離可能還在 SHIFT_WARN 以下。
 P0_WARN = 0.05
+# 「模型有多大把握」也單獨檢查（見 confidence）：test 減 CV 的差超過這個值就在報告裡標出來。
+# 不用 test 內部轉移的樹模型與序列模型，落點約 ±0.01、球種約 −0.02～−0.005；
+# 用了 test 內部轉移的樹模型（_fa）落點是 +0.02～+0.10：test 的每一列都有同場的內部轉移可學，CV 的驗證 fold 沒有。
+# 這個值是看過上面的數字才定的，離不用 test 內部轉移的樹模型（−0.022）不遠，只當提醒用。
+CONF_WARN = 0.03
+
+
+def confidence(p, drop0: bool = False) -> float:
+    """機率分佈的平均最大機率（模型有多大把握）。drop0=True 時先拿掉類別 0 再重新歸一，
+    也就是只看「不是終結拍時」的條件分佈；這樣量到的差異與終結拍比例無關。
+
+    prediction_shift 比的是決策之後的類別比例，看不到這種差異：一個方法可以在 test 上比 CV 更有把握
+    （它在 test 上學到了 CV 驗證 fold 沒有的資訊），而預測的類別比例幾乎不變。"""
+    p = np.asarray(p, dtype=float)
+    if drop0:
+        p = p[:, 1:] / np.clip(p[:, 1:].sum(1, keepdims=True), 1e-12, None)
+    return float(p.max(1).mean())
 
 
 def _display_path(p: Path) -> str:
@@ -377,7 +400,7 @@ def main():
     ap.add_argument("--exclude", nargs="*", default=[], help="不納入比較的方法名稱，例如 lgbm_prog cat_prog")
     ap.add_argument("--tag", default="", help="輸出檔名後綴，例如 noprog → submission_noprog.csv")
     ap.add_argument("--no-nested", action="store_true", help="跳過巢狀估計（省時間）")
-    ap.add_argument("--preset", choices=sorted(PRESETS), help="只用預先定義的方法集（final / noprog / r1）")
+    ap.add_argument("--preset", choices=sorted(PRESETS), help="只用預先定義的方法集（final / nofa / noprog / r1）")
     ap.add_argument("--no-relocate", action="store_true",
                     help="不把 test 打散的 rally 放回原比賽（對照用；OOF 也必須是在同樣設定下訓練的）")
     ap.add_argument("--no-terminal-update", action="store_true",
@@ -564,6 +587,18 @@ def main():
                         **{f"oof_{t}": final[t]["oof"].astype(np.float32) for t in ("a", "p", "w")},
                         **{f"te_{t}": np.asarray(final[t]["test"], dtype=np.float32) for t in ("a", "p", "w")})
     p0_cv, p0_te = float(shift["p"][0][0]), float(shift["p"][1][0])
+    # 最終集成與它的成員在 CV 與 test 上「有多大把握」（落點只看非終結拍的條件分佈；test 只算有比分推移的列）
+    reliable = ~unreliable
+    members = list(dict.fromkeys(n for t in ("a", "p") for k in ("recipe", "recipe_plain")
+                                 for n, _ in final[t].get(k, [])))
+    conf_rows = [("最終集成", *[(confidence(final[t]["oof"][all_sel], t == "p"),
+                               confidence(final[t]["test"][reliable], t == "p")) for t in ("a", "p")])]
+    for n in members:
+        conf_rows.append((f"`{n}`", *[(confidence(methods[n][f"oof_{t}"][all_sel], t == "p"),
+                                       confidence(methods[n][f"te_{t}"][reliable], t == "p"))
+                                      if f"oof_{t}" in methods[n] else None for t in ("a", "p")]))
+    conf_flagged = [name for name, *cells in conf_rows[1:]
+                    if any(c is not None and abs(c[1] - c[0]) > CONF_WARN for c in cells)]
 
     # --- 4. 報告 ---
     fmt = board.round(4)
@@ -614,6 +649,18 @@ def main():
                for t, lab in (("a", "action"), ("p", "point")) if shift[t][2] > SHIFT_WARN],
              *([f"- ⚠️ 預測為落點 0 的比例在 CV 與 test 差了 {abs(p0_cv - p0_te):.3f}（> {P0_WARN}）："
                 "test 端可能低估或高估終結拍"] if abs(p0_cv - p0_te) > P0_WARN else []),
+             "",
+             "機率分佈的平均最大機率（模型有多大把握；落點只看「不是終結拍時」的條件分佈）。"
+             "上面的類別比例看不到這種差異。", "",
+             "| | action：CV | test | 差 | point（非終結）：CV | test | 差 |",
+             "|---|---:|---:|---:|---:|---:|---:|",
+             *["| " + name + " | " + " | ".join(
+                 f"{c[0]:.3f} | {c[1]:.3f} | {c[1] - c[0]:+.3f}" if c is not None else "— | — | —" for c in cells) + " |"
+               for name, *cells in conf_rows],
+             "",
+             *([f"- ⚠️ {', '.join(conf_flagged)} 在 test 上比 CV 更有把握（差 > {CONF_WARN}）：它在 test 上用到了 "
+                "CV 驗證 fold 沒有的資訊（例如同場的 test 內部轉移），CV 分數量不到這部分在 test 上的好處或壞處"]
+               if conf_flagged else []),
              "",
              "配方：", "```json",
              json.dumps({**{t: [(n, round(w, 3)) for n, w in final[t]["recipe"]] for t in ("a", "p", "w")},

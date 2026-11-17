@@ -452,3 +452,28 @@ def test_prediction_shift_measures_distribution_gap():
     assert np.allclose(a, [0.5, 0.25, 0.25]) and np.allclose(a, b) and tv == 0.0
     a, b, tv = prediction_shift(cv, np.array([1, 1, 2, 2]), classes)
     assert np.allclose(b, [0.0, 0.5, 0.5]) and abs(tv - 0.5) < 1e-12
+
+
+def test_confidence_ignores_terminal_share():
+    """drop0=True 只看非終結拍的條件分佈：類別 0 的機率怎麼變，量到的把握程度都不變。"""
+    from arena import confidence
+    p = np.array([[0.5, 0.3, 0.2], [0.1, 0.45, 0.45]])
+    assert abs(confidence(p) - 0.475) < 1e-12
+    assert abs(confidence(p, drop0=True) - 0.55) < 1e-12              # (0.6 + 0.5) / 2
+    q = p.copy()
+    q[:, 0], q[:, 1:] = 0.9, 0.1 * p[:, 1:] / p[:, 1:].sum(1, keepdims=True)
+    assert abs(confidence(q, drop0=True) - 0.55) < 1e-12
+    assert confidence(np.array([[0.0, 0.9, 0.1]]), drop0=True) > confidence(np.array([[0.0, 0.5, 0.5]]), drop0=True)
+
+
+def test_nofa_preset_is_final_without_fa():
+    """nofa 與 final 只差終結拍分解的樹模型，順序也相同（貪婪選擇的結果會跟候選順序有關）。"""
+    from arena import FA_METHODS, PRESETS
+    assert len(FA_METHODS) == 7 and all(m.endswith("_fa") for m in FA_METHODS)
+    nofa, final = PRESETS["nofa"], PRESETS["final"]
+    assert len(nofa) == len(final) - 7
+    assert set(final) - set(nofa) == FA_METHODS and set(nofa) <= set(final)
+    assert not any(m.endswith("_fa") for m in nofa)
+    # 順序相同：nofa 是 final 的子序列
+    it = iter(final)
+    assert all(m in it for m in nofa)
