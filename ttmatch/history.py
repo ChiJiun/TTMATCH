@@ -4,15 +4,15 @@ test 每場比賽平均可見 23 個 rally，而且 train 與 test 的比賽不�
 怎麼打」是選手 ID 之外合法可用的訊息（只用該 rally 之前的 rally，不碰任何要預測的那一拍）。
 
 分佈對齊（與比分推移特徵的 train 模擬同一精神）：test 跟 train 有以下差異，前兩點 train 端要模擬——
-1. test 每局只看得到約 34% 的 rally（rally_id 間隔 2–4）；
+1. test 每局只看得到約 37% 的 rally（rally_id 間隔 2–4）；
 2. test 的 rally 只看得到前綴 k 拍（多半 1–3 拍），且第 k+1 拍一定存在（那是要預測的拍），所以
    看不到 rally 的最後一拍；
-→ train 先以 34% 機率決定每個 rally 是否可見（這一步與 rally 長度無關），再把 test 的前綴長度分佈
+→ train 先以 37% 機率決定每個 rally 是否可見（這一步與 rally 長度無關），再把 test 的前綴長度分佈
    「配對」到可見 rally 上：由長到短的 k 依序從「長度 ≥ k+1 且尚未指派」的 rally 中隨機挑出應有的
    數量；配不到的 rally 取 k = 長度 − 1。偏向長 rally 的只有 k 的分配（長 k 只能配給夠長的 rally），
    不是「哪些 rally 可見」。這樣可見 rally 的前綴長度分佈與 test 幾乎相同，且永遠不含 rally 的最後一拍。
-3. test 的 match 340–354 是被打散的 rally。能定位的（187 個）已先放回原本的比賽（ttmatch/relocate.py），
-   它們的 history 與正常 rally 相同；定位不出來的 75 個留在假的 match 裡，幾乎沒有 history（hist_n 接近 0），
+3. test 的 match 340–354 是被打散的 rally。能定位的（215 個）已先放回原本的比賽（ttmatch/relocate.py），
+   它們的 history 與正常 rally 相同；定位不出來的 47 個留在假的 match 裡，幾乎沒有 history（hist_n 接近 0），
    特徵會退回全體平均。
 """
 from __future__ import annotations
@@ -33,7 +33,7 @@ OHIST_FEATURES = ["o" + c for c in HIST_FEATURES]
 
 
 def test_visible_rally_frac(test_df: pd.DataFrame) -> float:
-    """test 正常 match 裡每局可見 rally 數 / 該局最大 rally_id，約 0.34。"""
+    """test 正常 match 裡每局可見 rally 數 / 該局最大 rally_id，約 0.37（0.3719）。"""
     rt = test_df.groupby("rally_uid", sort=False).first().reset_index()
     rt = rt[~rt["match"].isin(inconsistent_matches(test_df))]
     g = rt.groupby(["match", "numberGame"])["rally_id"].agg(["count", "max"])

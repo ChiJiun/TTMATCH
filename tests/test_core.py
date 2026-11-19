@@ -578,30 +578,71 @@ def test_train_factored_sim_aug_has_no_leak(monkeypatch):
         return out
 
     monkeypatch.setattr(trees, "_fit_predict", fake_fit_predict)
-    out = trees.train_factored("lgbm", D, targets=("p",), n_folds=3, sim_aug=True)
     uid, plen, match = base["rally_uid"].to_numpy(), base["prefix_len"].to_numpy(), base["match"].to_numpy()
+    vis = {int(u): (int(k0), int(k1)) for u, k0, k1 in zip(uid, base["vis_k0"], base["vis_k1"])}
     eval_rows = set(np.concatenate(cut_matched_indices(base, D["cut_g"], 5)).tolist())
-    n_own, n_exact = 0, 0
-    for i in range(len(base)):
-        c = calls[int(round(out["oof_p"][i, 0]))]
-        assert c["n_class"] == 10
-        own = [q for (u, q) in c["tr"] if u == uid[i]]
-        assert all(q < plen[i] for q in own), (uid[i], plen[i], own, i in eval_rows)
-        assert not (c["tr"] & c["es"])
-        # 訓練列除了 test 內部轉移（−1）與其他 fold 的 match，只能有同一個驗證 fold 的模擬內部轉移
-        n_own += bool(own)
-        k = max(base["vis_k0"].iloc[i], base["vis_k1"].iloc[i])
-        if k >= 2 and plen[i] == k:           # 與 test 同條件：自己的第 1..k−1 列都在訓練裡
-            assert sorted(own) == list(range(1, k))
-            n_exact += 1
-    assert n_exact > 20 and n_own > n_exact
-    # 每個非終結條件模型都用了 test 內部轉移與驗證 fold 的模擬轉移；3 個 fold × 2 組模擬
-    multi = [c for c in calls if c["n_class"] == 10]
-    assert len(multi) == 6 and all(any(u == -1 for u, _ in c["tr"]) for c in multi)
-    # sim_aug=False（既有的 _fa）不受影響：訓練資料裡沒有任何驗證 fold 的列
-    calls.clear()
-    out = trees.train_factored("lgbm", D, targets=("p",), n_folds=3, sim_aug=False)
-    for i in range(len(base)):
-        c = calls[int(round(out["oof_p"][i, 0]))]
-        fold_matches = {m for u, _ in c["es"] for m in [u // 20]}
-        assert match[i] in fold_matches and not any(u // 20 in fold_matches for u, _ in c["tr"] if u >= 0)
+    for t, n_cls in (("p", 10), ("a", 15)):              # 兩個任務都跑一遍（類別數不同）
+        calls.clear()
+        out = trees.train_factored("lgbm", D, targets=(t,), n_folds=3, sim_aug=True)
+        n_own, n_exact = 0, 0
+        for i in range(len(base)):
+            c = calls[int(round(out[f"oof_{t}"][i, 0]))]
+            assert c["n_class"] == n_cls
+            own = [q for (u, q) in c["tr"] if u == uid[i]]
+            assert all(q < plen[i] for q in own), (uid[i], plen[i], own, i in eval_rows)
+            assert not (c["tr"] & c["es"])
+            n_own += bool(own)
+            k = max(base["vis_k0"].iloc[i], base["vis_k1"].iloc[i])
+            if k >= 2 and plen[i] == k:       # 與 test 同條件：自己的第 1..k−1 列都在訓練裡
+                assert sorted(own) == list(range(1, k))
+                n_exact += 1
+        assert n_exact > 20 and n_own > n_exact
+        # 訓練列除了 test 內部轉移（−1）與其他 fold 的 match，只能有同一個驗證 fold 的「模擬內部轉移」：
+        # 屬於驗證 fold 的 match 的訓練列，都在同一組模擬（g）的可見前綴裡（prefix_len < vis_k_g）
+        multi = [c for c in calls if c["n_class"] == n_cls]
+        n_sim_rows = 0
+        for c in multi:
+            fold_matches = {u // 20 for u, _ in c["es"] if u >= 0}
+            in_fold = [(u, q) for u, q in c["tr"] if u >= 0 and u // 20 in fold_matches]
+            n_sim_rows += len(in_fold)
+            assert any(all(q < vis[u][g] for u, q in in_fold) for g in (0, 1))
+            assert all(vis[u][0] * vis[u][1] == 0 for u, _ in in_fold)      # 兩組可見的 rally 不重疊
+        assert n_sim_rows > 0
+        # 每個非終結條件模型都用了 test 內部轉移；3 個 fold × 2 組模擬
+        nonterminal = [c for c in multi if any(u == -1 for u, _ in c["tr"])]      # action 另有 3 個終結條件模型
+        assert len(nonterminal) == 6 and len(multi) == (6 if t == "p" else 9)
+        # sim_aug=False（既有的 _fa）不受影響：訓練資料裡沒有任何驗證 fold 的列
+        calls.clear()
+        out = trees.train_factored("lgbm", D, targets=(t,), n_folds=3, sim_aug=False)
+        for i in range(len(base)):
+            c = calls[int(round(out[f"oof_{t}"][i, 0]))]
+            fold_matches = {m for u, _ in c["es"] for m in [u // 20]}
+            assert match[i] in fold_matches and not any(u // 20 in fold_matches for u, _ in c["tr"] if u >= 0)
+
+
+def test_nofa_preset_is_final_without_fa():
+    """nofa 與 final 只差終結拍分解的樹模型，順序也相同（貪婪選擇的結果會跟候選順序有關）。"""
+    from arena import FA_METHODS, PRESETS
+    assert len(FA_METHODS) == 7 and all(m.endswith("_fa") for m in FA_METHODS)
+    nofa, final = PRESETS["nofa"], PRESETS["final"]
+    assert len(nofa) == len(final) - 7
+    assert set(final) - set(nofa) == FA_METHODS and set(nofa) <= set(final)
+    assert not any(m.endswith("_fa") for m in nofa)
+    # 順序相同：nofa 是 final 的子序列
+    it = iter(final)
+    assert all(m in it for m in nofa)
+
+
+def test_fs_presets_replace_fa_with_fs():
+    """`fs` 是 nofa 加上 8 個 `_fs`（也就是 final 把 `_fa` 換成 `_fs`）；`final_fs` 是 final 加 `_fs`；
+    `_fs` 都能用 run_method.py 訓練，而且比分推移的標記與 PROG_METHODS 一致。"""
+    from arena import FS_METHODS, FINAL_METHODS, NOFA_METHODS, PRESETS, PROG_METHODS
+    from run_method import METHODS
+    assert len(FS_METHODS) == 8 and len(set(FS_METHODS)) == 8 and not set(FS_METHODS) & set(FINAL_METHODS)
+    for name in FS_METHODS:
+        assert name in METHODS and METHODS[name][1].uses_prog == (name in PROG_METHODS), name
+    assert PRESETS["fs"] == NOFA_METHODS + FS_METHODS
+    assert PRESETS["final_fs"] == FINAL_METHODS + FS_METHODS
+    assert not any(m.endswith("_fa") for m in PRESETS["fs"] + PRESETS["noprog_fs"])
+    assert not any(METHODS[n][1].uses_prog for n in PRESETS["noprog_fs"])
+    assert set(PRESETS["fs"]) - set(PRESETS["noprog_fs"]) == set(PRESETS["fs"]) & PROG_METHODS

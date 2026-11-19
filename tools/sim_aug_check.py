@@ -110,7 +110,7 @@ def train_fold_player_rows(base: pd.DataFrame) -> np.ndarray:
 
 
 def main():
-    names = sys.argv[1:] or sorted(f.stem for f in config.OOF_DIR.glob("*.npz"))
+    names = sys.argv[1:] or sorted(f.stem for f in config.OOF_DIR.glob("*.npz") if not f.stem.endswith("_fast"))
     D = build_datasets()
     base, tp = D["ap_base"], D["test_pred"]
     sel = np.concatenate(Evaluator(D).sel)

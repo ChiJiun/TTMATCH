@@ -21,7 +21,8 @@
   python arena.py --no-override                           # 不嘗試規則修正
   python arena.py --no-nested                             # 跳過巢狀估計
   python arena.py --no-terminal-update                    # 不做終結拍更新（對照）
-  python arena.py --preset final                          # 只用 README 結果所用的方法集（FINAL_METHODS）
+  python arena.py --preset final                          # 改善回合 3 的方法集（FINAL_METHODS，含 _fa）
+  python arena.py --preset nofa --tag nofa                # 同上但不含 _fa（README 最後採用）→ outputs/submission_nofa.csv
 """
 from __future__ import annotations
 import argparse
@@ -54,7 +55,7 @@ R1_METHODS = [
 # winner 一律依截斷機制加權；action/point 兩種都放（預設加權，`_eq` 不加權），序列模型含 history 的加權版
 # （`_al`）與不加權版都放，交給貪婪選擇與巢狀估計挑。CatBoost 的 action/point 太慢（單一方法約 1–1.5 小時）
 # 而且前兩輪都沒被選進集成，這一輪沒有重訓，不在候選裡。
-R3_METHODS = [
+FINAL_METHODS = [
     # winner（比分推移）
     "cat_prog", "cat_prog_bag3", "lgbm_prog", "xgb_prog", "cat_hist_w", "lgbm_hist_w", "xgb_hist_w",
     # 三任務的樹模型（不含比分推移；winner 也供放不回去的打散 rally 使用）
@@ -75,18 +76,22 @@ FS_METHODS = [
     "lgbm_hist_fs", "lgbm_hist_prog_fs", "xgb_hist2_fs", "xgb_hist2_prog_fs",
     "lgbm_hist_fs1", "lgbm_hist_prog_fs1", "xgb_hist2_fs1", "xgb_hist2_prog_fs1",
 ]
-# README「結果」所用的方法集：回合 3 的方法集把 `_fa` 換成 `_fs`。`_fa` 的 OOF 沒有 test 才有的同場內部轉移，
-# 它在集成裡的 CV 分數與 test 上的行為不是同一件事；`_fs` 兩邊一致，所以用到 test 內部轉移的成員只留 `_fs`。
-FINAL_METHODS = [m for m in R3_METHODS if not m.endswith("_fa")] + FS_METHODS
 # 不含比分推移特徵的版本（課堂規則若不允許比分推移時使用）
 PROG_METHODS = {"cat_prog", "cat_prog_bag3", "lgbm_prog", "xgb_prog", "cat_hist_w", "lgbm_hist_w", "xgb_hist_w",
                 "lgbm_hist_prog", "xgb_hist2_prog", "transformer_hist2_prog_al",
                 "lgbm_hist_prog_fa", "xgb_hist2_prog_fa",
                 "lgbm_hist_prog_fs", "xgb_hist2_prog_fs", "lgbm_hist_prog_fs1", "xgb_hist2_prog_fs1"}
 NOPROG_METHODS = [m for m in FINAL_METHODS if m not in PROG_METHODS]
-# r3 = 回合 3（含 `_fa`）；r3_fs = 回合 3 再加 `_fs`（`_fa` 也留著，對照用）
-PRESETS = {"final": FINAL_METHODS, "noprog": NOPROG_METHODS, "r1": R1_METHODS, "r3": R3_METHODS,
-           "r3_fs": R3_METHODS + FS_METHODS}
+# 拿掉終結拍分解樹模型（`_fa`）的版本，README 最後採用的是這一個：`_fa` 在 test 上比 CV 更有把握（見 CONF_WARN），
+# 這部分 CV 量不到；而拿掉之後巢狀估計沒有變差。
+FA_METHODS = {m for m in FINAL_METHODS if m.endswith("_fa")}
+NOFA_METHODS = [m for m in FINAL_METHODS if m not in FA_METHODS]
+# `_fs` 的版本（截止後分析）：`nofa` 再加 8 個 `_fs`，也就是回合 3 的方法集把 7 個 `_fa` 換成 `_fs`；
+# `final_fs` 是 `final` 再加 `_fs`（`_fa` 也留著，確認貪婪選擇是不是還會選它們）；`noprog_fs` 拿掉比分推移的方法。
+FS_PRESET = NOFA_METHODS + FS_METHODS
+PRESETS = {"final": FINAL_METHODS, "nofa": NOFA_METHODS, "noprog": NOPROG_METHODS, "r1": R1_METHODS,
+           "fs": FS_PRESET, "final_fs": FINAL_METHODS + FS_METHODS,
+           "noprog_fs": [m for m in FS_PRESET if m not in PROG_METHODS]}
 BLEND_GRID = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
 MIN_GAIN = 5e-4
 # 對照用的方法：樹模型直接併入 test 內部轉移，test 上會低估終結拍（見 ttmatch/methods/trees.py）。
@@ -249,6 +254,7 @@ def terminal_update(p, a, pw, prefix_len, stats: dict, lam: float):
     lose = np.where((k + 1) % 2 == 1, 1 - pw, pw)
     p0 = np.clip(p[:, 0].astype(float), 1e-6, 1 - 1e-6)
     prior = p0 + (1 - p0) * stats["q"][np.minimum(k, TU_KCAP)]
+    # prior ≥ p0、lose ≤ 1，所以 λ ≤ 1 時更新後的機率不超過 p0^(1−λ) ≤ 1；clip 只是保險，不會真的截到
     post = np.clip(p0 * (lose / prior) ** lam, 0.0, 1.0)
     rest = p[:, 1:] / np.clip(p[:, 1:].sum(1, keepdims=True), 1e-12, None)
     p_new = np.concatenate([post[:, None], (1 - post)[:, None] * rest], axis=1)
@@ -375,6 +381,7 @@ P0_WARN = 0.05
 # 「模型有多大把握」也單獨檢查（見 confidence）：test 減 CV 的差超過這個值就在報告裡標出來。
 # 不用 test 內部轉移的樹模型與序列模型，落點約 ±0.01、球種約 −0.02～−0.005；
 # 用了 test 內部轉移的樹模型（_fa）落點是 +0.02～+0.10：test 的每一列都有同場的內部轉移可學，CV 的驗證 fold 沒有。
+# 這個值是看過上面的數字才定的，離不用 test 內部轉移的樹模型（−0.022）不遠，只當提醒用。
 CONF_WARN = 0.03
 
 
@@ -663,7 +670,7 @@ def main():
                  f"{c[0]:.3f} | {c[1]:.3f} | {c[1] - c[0]:+.3f}" if c is not None else "— | — | —" for c in cells) + " |"
                for name, *cells in conf_rows],
              "",
-             *([f"- ⚠️ {', '.join(conf_flagged)} 在 test 上比 CV 更有把握（差 > {CONF_WARN}）：它在 test 上用到了"
+             *([f"- ⚠️ {', '.join(conf_flagged)} 在 test 上比 CV 更有把握（差 > {CONF_WARN}）：它在 test 上用到了 "
                 "CV 驗證 fold 沒有的資訊（例如同場的 test 內部轉移），CV 分數量不到這部分在 test 上的好處或壞處"]
                if conf_flagged else []),
              "",

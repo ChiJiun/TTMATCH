@@ -47,7 +47,8 @@ def build_datasets(use_test_aug: bool = True, relocate: bool = True) -> dict:
     tef = tef.merge(score_progression_test(te), on="rally_uid", how="left")
 
     # 同場先前 rally 的選手傾向；train 依 test 的可見 rally 比例與前綴長度分佈模擬
-    trf = attach_history(trf, match_history(tr, test_length_probs(tef), test_visible_rally_frac(te)))
+    len_probs, keep_prob = test_length_probs(tef), test_visible_rally_frac(te)
+    trf = attach_history(trf, match_history(tr, len_probs, keep_prob))
     tef = attach_history(tef, match_history(te))
 
     ap_base = _strip_serve_targets(trf)
@@ -75,7 +76,7 @@ def build_datasets(use_test_aug: bool = True, relocate: bool = True) -> dict:
     # 把 train 的 match 模擬成 test 的可見樣式（vis_k0 與 history 特徵是同一組模擬）：樹模型的終結拍分解在
     # 交叉驗證時，用驗證 match 的「模擬內部轉移」（prefix_len < vis_k 的列）重現 test 內部轉移的效果。
     # vis_k* 與 sim_aug_w 都不是特徵（見 ttmatch/methods/trees.py 的 train_factored）
-    vis = simulated_visible_sets(tr, test_length_probs(tef), test_visible_rally_frac(te), N_SIM_SETS)
+    vis = simulated_visible_sets(tr, len_probs, keep_prob, N_SIM_SETS)     # 與 history 特徵用同一組參數
     for c in vis.columns:
         ap_base[c] = ap_base["rally_uid"].map(vis[c]).astype(int).to_numpy()
     ap_base["sim_aug_w"] = aug_w(ap_base["prefix_len"])
