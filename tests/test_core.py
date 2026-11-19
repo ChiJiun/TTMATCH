@@ -454,6 +454,21 @@ def test_prediction_shift_measures_distribution_gap():
     assert np.allclose(b, [0.0, 0.5, 0.5]) and abs(tv - 0.5) < 1e-12
 
 
+def test_flag_confidence_separates_directions():
+    """超過門檻才列入，並依正負分到「更有把握」或「更沒把握」；沒有該任務（None）時略過。"""
+    from arena import flag_confidence
+    rows = [
+        ("up", (0.50, 0.54), None),          # action +0.04
+        ("down", None, (0.34, 0.30)),        # point −0.04
+        ("both", (0.50, 0.46), (0.34, 0.40)),
+        ("ok", (0.50, 0.52), (0.34, 0.33)),  # 都在 ±0.03 內
+        ("none", None, None),
+    ]
+    more, less = flag_confidence(rows, warn=0.03)
+    assert more == ["up", "both"]
+    assert less == ["down", "both"]
+
+
 def test_confidence_ignores_terminal_share():
     """drop0=True 只看非終結拍的條件分佈：類別 0 的機率怎麼變，量到的把握程度都不變。"""
     from arena import confidence

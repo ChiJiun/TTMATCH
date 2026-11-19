@@ -397,6 +397,19 @@ def confidence(p, drop0: bool = False) -> float:
     return float(p.max(1).mean())
 
 
+def flag_confidence(rows, warn=CONF_WARN):
+    """rows 每列是 (名稱, action 的 (CV, test), point 的 (CV, test))，沒有該任務時是 None。
+    回傳 (test 比 CV 更有把握的名稱, test 比 CV 更沒把握的名稱)；差的絕對值超過 warn 才列入。"""
+    more, less = [], []
+    for name, *cells in rows:
+        diffs = [c[1] - c[0] for c in cells if c is not None]
+        if any(d > warn for d in diffs):
+            more.append(name)
+        if any(d < -warn for d in diffs):
+            less.append(name)
+    return more, less
+
+
 def _display_path(p: Path) -> str:
     """repo 內的路徑顯示相對路徑，否則顯示絕對路徑（設了 TTMATCH_OUT_DIR 時）。"""
     try:
@@ -609,8 +622,7 @@ def main():
         conf_rows.append((f"`{n}`", *[(confidence(methods[n][f"oof_{t}"][all_sel], t == "p"),
                                        confidence(methods[n][f"te_{t}"][reliable], t == "p"))
                                       if f"oof_{t}" in methods[n] else None for t in ("a", "p")]))
-    conf_flagged = [name for name, *cells in conf_rows[1:]
-                    if any(c is not None and abs(c[1] - c[0]) > CONF_WARN for c in cells)]
+    conf_more, conf_less = flag_confidence(conf_rows[1:])
 
     # --- 4. 報告 ---
     fmt = board.round(4)
@@ -670,9 +682,12 @@ def main():
                  f"{c[0]:.3f} | {c[1]:.3f} | {c[1] - c[0]:+.3f}" if c is not None else "— | — | —" for c in cells) + " |"
                for name, *cells in conf_rows],
              "",
-             *([f"- ⚠️ {', '.join(conf_flagged)} 在 test 上比 CV 更有把握（差 > {CONF_WARN}）：它在 test 上用到了 "
+             *([f"- ⚠️ {', '.join(conf_more)} 在 test 上比 CV 更有把握（差 > {CONF_WARN}）：它在 test 上用到了 "
                 "CV 驗證 fold 沒有的資訊（例如同場的 test 內部轉移），CV 分數量不到這部分在 test 上的好處或壞處"]
-               if conf_flagged else []),
+               if conf_more else []),
+             *([f"- ⚠️ {', '.join(conf_less)} 在 test 上比 CV 更沒把握（差 < −{CONF_WARN}）：test 的輸入分佈與 CV 不同，"
+                "CV 分數可能高估它在 test 上的表現"]
+               if conf_less else []),
              "",
              "配方：", "```json",
              json.dumps({**{t: [(n, round(w, 3)) for n, w in final[t]["recipe"]] for t in ("a", "p", "w")},
