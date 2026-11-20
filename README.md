@@ -56,7 +56,7 @@ train.csv / test.csv
 | XGBoost / CatBoost 對照 | [lucas6028](https://github.com/lucas6028/AI_CUP_2026_Table_Tennis_Prediction) | `ttmatch/methods/trees.py` |
 | **比分推移特徵**、選手 ID 嵌入 | 本 repo 新增 | `ttmatch/features.py`、`ttmatch/methods/nn.py` |
 
-以上程式碼改寫自各隊公開的 repo，每個檔案開頭都標註了出處；原作著作權屬原作者。
+以上程式碼改寫自各隊公開的 repo，`ttmatch/` 底下改寫自他隊的檔案開頭都標註了出處（`arena.py`、`run_method.py` 是本 repo 的流程程式，出處見上表）；原作著作權屬原作者。
 
 ## 一、資料前處理（`ttmatch/data.py`、`ttmatch/features.py`）
 
@@ -74,9 +74,9 @@ train 與 test 的每一列是一拍。把「觀測完第 1..t 拍、預測第 t
 
 ### 特徵（每一列只用第 1..t 拍可得的資訊）
 
-- **類別特徵 23 個**：性別、局數、下一拍是第幾種擊球；上一拍、前一拍、前兩拍的球種／落點／正反手／力道／旋轉／站位；發球拍的球種、旋轉、力道、落點、正反手；**下一拍擊球者的選手 ID**。還沒發生的拍用哨兵類別 50 表示。
-- **數值特徵 27 個**：前綴長度、擊球者是否為發球方、是否在預測接發球／第三拍；發球方與接發方比分、比分差、總分、是否局點、是否 deuce；到目前為止攻擊／控制／防守的次數、出界與掛網次數、平均力道、攻擊比例、最近兩拍是否攻擊等。
-- **選手 target encoding**（只有 `lgbm` 使用）：`P(下一拍球種 | 下一拍擊球者)` 等三組。訓練列的編碼用巢狀 OOF（內層依比賽再切 5 份），避免編碼裡含有自己的答案；第 3 名原本的寫法有這個洩漏，這裡已修正。
+- **類別特徵 23 個**：性別、局數、下一拍的擊球類型（`next_strikeId`）；上一拍的球種／落點／正反手／力道／旋轉／擊球類型（`last_strikeId`）／站位，前一拍（倒數第 2 拍）的球種／落點／正反手／旋轉／力道，前兩拍（倒數第 3 拍）的球種／落點；發球拍的球種、旋轉、力道、落點、正反手；**下一拍擊球者的選手 ID**。還沒發生的拍用哨兵類別 50 表示。
+- **數值特徵 27 個**：前綴長度、擊球者是否為發球方、是否在預測接發球／第三拍；發球方與接發方比分、比分差、總分、是否局點、是否 deuce；到目前為止攻擊／控制／防守的次數、落點為 0／1–3（短球區）／7–9（長球區）的次數、平均力道、攻擊比例、最近兩拍是否攻擊等。
+- **選手 target encoding**（`lgbm`、`lgbm_te20`，以及序列模型 `gru`、`transformer`、`gru_t2v_film`、`gru_mirror` 使用；`lgbm_note`、`xgb`、`cat`、`*_pemb` 等不用）：樹模型用 `P(下一拍球種 | 下一拍擊球者)` 等三組，序列模型只用 `P(下一拍球種 | 下一拍擊球者)` 這一組。訓練列的編碼用巢狀 OOF（內層依比賽再切 5 份），避免編碼裡含有自己的答案；第 3 名原本的寫法有這個洩漏，這裡已修正。
 
 ### 本 repo 新增：比分推移特徵（只用於 winner）
 
@@ -119,7 +119,7 @@ test 裡同一局會出現好幾個 rally。**同一局下一個可見 rally 的
 - action、point 是多類別分類，winner 是二元分類，三個目標分開訓練。
 - 類別權重：與類別頻率的 −0.5 次方成正比，讓稀有類別也被學到（Macro-F1 對每一類一視同仁）。
 - action / point 的訓練資料是 train fold 的樣本加上 `ap_aug`（test 內部轉移，權重 ×5），讓模型看到 test 選手的打法。
-- LightGBM：learning rate 0.05、num_leaves 63、feature / bagging fraction 0.8、L2 1.0，最多 1500 輪，驗證 fold 上 50 輪沒有進步就停止。
+- LightGBM：learning rate 0.05、num_leaves 63（winner 為 47）、feature / bagging fraction 0.8、L2 1.0，最多 1500 輪，驗證 fold 上 50 輪沒有進步就停止。
 - XGBoost：learning rate 0.06、max_depth 7、subsample / colsample 0.8，最多 1500 輪，early stopping 50 輪。
 - CatBoost：learning rate 0.12、depth 6、最多 700 輪，early stopping 60 輪；限制 CTR 組合以控制訓練時間。
 
@@ -140,7 +140,7 @@ test 裡同一局會出現好幾個 rally。**同一局下一個可見 rally 的
 3. **誠實的調參**：把比賽分成兩半，決策規則在一半上調、在另一半上評分，兩半互換取平均，避免在同一批資料上調參又評分而高估。
 4. **貪婪集成（優勝劣汰）**：每個目標各自從最佳單一方法開始，依序嘗試加入其他方法（權重 0.1–0.6），只有讓分數至少進步 0.0005 的方法才留下，其餘淘汰。winner 用 AUC 做同樣的選擇。
 5. **另外評估、最後沒有採用**：依前綴長度分組的決策規則、第 22 名的規則修正（預測的類別在同一情境從未出現時改成眾數），兩者在 CV 上的增益都小於 0.0005。
-6. 產生提交檔：決策規則在全部 OOF 上重新調參後套到 test；test 異常比賽（match 340–354）的 winner 改用不含比分推移的集成。
+6. 產生提交檔：決策規則在 5 次前綴長度抽樣合併（串接）後的樣本上重新調參後套到 test；test 異常比賽（match 340–354）的 winner 改用不含比分推移的集成。
 
 ## 五、結果
 
@@ -173,7 +173,7 @@ test 裡同一局會出現好幾個 rally。**同一局下一個可見 rally 的
 | winner（test 異常比賽的 262 列，不含比分推移） | cat 0.38、xgb 0.26、lgbm 0.20、transformer 0.16 | 0.6959 |
 | **overall** | | **0.4090** |
 
-這個 CV 分數的集成成員與權重是在同一批 OOF 上挑的，會略為樂觀。再扣掉 test 有 14.2% 的列拿不到比分推移資訊，預期 test 約 0.4055。
+這個 CV 分數的集成成員與權重是在同一批 OOF 上挑的，會略為樂觀。再扣掉 test 有 14.2% 的列拿不到比分推移資訊，預期 test 約 0.405（這個估計是後續 PR #3 才加上的 CV 模擬，不在這個版本的程式碼裡，僅供參考）。
 
 ### 主要發現
 
@@ -224,9 +224,9 @@ python run_method.py transformer gru gru_t2v_film gru_mirror gru_pemb transforme
 | `--device cuda` | 序列模型用 GPU 訓練（預設 `cpu`） |
 | `--epochs`、`--seeds` | 序列模型的 epoch 數與 seed 數（預設 16、2；繳交版本是 12、1） |
 | `--folds` | CV 的 fold 數（預設 5） |
-| `--fast` | 冒煙測試：少量輪數 / epoch，輸出 `*_fast.npz`；再執行 `python arena.py --fast` 會產生 `outputs/submission_fast.csv`，幾分鐘內就能確認整個流程跑得通 |
+| `--fast` | 冒煙測試：少量輪數 / epoch，輸出 `*_fast.npz`；再執行 `python arena.py --fast` 會產生 `outputs/submission_fast.csv`。例如 `python run_method.py lgbm_note cat_prog gru_pemb --fast --folds 2 --seeds 1 --epochs 1` 後接 `python arena.py --fast`，在 10 核 CPU 上約 5–10 分鐘 |
 
-在本機 CPU 上的訓練時間（10 核）：樹模型每個約 3–20 分鐘（`lgbm` 約 16 分鐘、`xgb` 約 4 分鐘；`cat` 較慢，約 20–55 分鐘；`*_prog` 只有 winner，幾秒到 3 分鐘）；序列模型每個約 20–40 分鐘。全部約 4–5 小時。沒有 GPU 時，也可以用 [`notebooks/colab_train_nn.ipynb`](notebooks/colab_train_nn.ipynb) 在 Colab 訓練序列模型，再把 `outputs/oof/*.npz` 下載回本機。
+在本機 CPU 上的訓練時間（10 核）：樹模型每個約 3–20 分鐘（`lgbm` 約 16 分鐘、`xgb` 約 4 分鐘；`cat` 較慢，約 20–55 分鐘；`*_prog` 只有 winner，幾秒到 3 分鐘）；序列模型每個約 20–40 分鐘。全部約 4–5 小時。沒有 GPU 時，也可以用 [`notebooks/colab_train_nn.ipynb`](notebooks/colab_train_nn.ipynb) 在 Colab 訓練序列模型，再把 `outputs/oof/*.npz` 下載回本機。注意 notebook 裡的指令是 `--epochs 20 --seeds 3`，要重現繳交版本請改成 `--epochs 12 --seeds 1`。
 
 ### 4. 評估、集成、產生提交檔
 
@@ -278,7 +278,7 @@ tests/test_core.py       單元測試
 
 ## 七、限制與事後檢討
 
-- **CV 與排行榜的落差**：CV 估計 test 約 0.4055，實際 public 0.41744、private 0.39028。private 只有約 609 列，Macro-F1 的抽樣雜訊不小。
+- **CV 與排行榜的落差**：預期 test 約 0.405（後續 PR #3 的 CV 模擬，不在這個版本的程式碼裡），實際 public 0.41744、private 0.39028。private 只有約 609 列，Macro-F1 的抽樣雜訊不小。
 - **事後才發現的問題：樹模型使用 test 內部轉移，會讓 test 上幾乎不預測落點 0**。`ap_aug` 的每一筆都「一定不是終結拍」（下一拍還看得到），而且和要預測的那一列來自同一個 rally，樹模型因此學到「長得像這個 rally 的列不會是終結拍」。CV 看不到這個偏差：驗證 fold 的 rally 沒有自己的前綴在訓練資料裡。point 集成的主要成員 `lgbm` 就是這種模型。繳交版本的提交檔沒有保留下來，影響大小沒有在這個版本上量過；在後續同樣有這個問題的版本上，估計讓 point Macro-F1 少約 0.02–0.05。這是截止後比較「CV 與 test 預測各類別的比例」才發現的。
 - 樹模型與序列模型的 early stopping 都用驗證 fold，OOF 分數會略為樂觀（各方法同樣受影響，方法之間的比較仍公平）。
 - 比分推移特徵用的是 test 檔中其他 rally 的比分欄位；它不需要外部資料，但是否符合課堂競賽的規則，由使用者自行判斷。
