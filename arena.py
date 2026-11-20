@@ -23,6 +23,7 @@
   python arena.py --no-terminal-update                    # 不做終結拍更新（對照）
   python arena.py --preset final                          # 改善回合 3 的方法集（FINAL_METHODS，含 _fa）
   python arena.py --preset nofa --tag nofa                # 同上但不含 _fa（README 最後採用）→ outputs/submission_nofa.csv
+  python arena.py --preset fs --tag fs                    # nofa 再加 8 個 _fs（截止後分析，沒有上傳）→ outputs/submission_fs.csv
 """
 from __future__ import annotations
 import argparse
