@@ -2,7 +2,7 @@
 
 Kaggle 課堂競賽 [Introduction to Data Science Competition — TTMATCH](https://www.kaggle.com/competitions/introduction-to-data-science-competition-ttmatch) 的程式碼與說明文件。
 
-本題資料源自 **AI CUP 2026 春季賽「基於時序資料之桌球戰術與結果預測競賽」**（423 隊）。這份解法的做法是：把該賽前段班公開的方法改寫成同一套程式，放在**同一套資料切分與評分**下比較，淘汰表現差的方法，再把留下來的方法集成；另外加入一個自己設計的特徵（比分推移）。
+這份解法的做法是：實作多種樹模型與序列模型，放在**同一套資料切分與評分**下比較，淘汰表現差的方法，再把留下來的方法集成；另外加入一個自己設計的特徵（比分推移）。
 
 ## 成績
 
@@ -43,21 +43,6 @@ train.csv / test.csv
    └─ 4. 產生 outputs/submission.csv
 ```
 
-### 參考的方法與出處
-
-| 方法 | 來源（AI CUP 2026 私榜名次） | 本 repo 位置 |
-|---|---|---|
-| LightGBM + 選手 target encoding + test 內部轉移擴充 | [0000workjason](https://github.com/0000workjason/aicup2026-tabletennis-prediction)（第 3 名） | `ttmatch/methods/trees.py` |
-| 因果多任務 GRU / Transformer | 同上 | `ttmatch/methods/nn.py` |
-| Macro-F1 決策規則（溫度 + 類別偏置） | 同上；第 5 名的 prior-correction 是它的特例 | `ttmatch/decision.py` |
-| 依 match 分組的 CV、依 test 前綴長度評估 | 同上 | `ttmatch/cv.py` |
-| GRU + Time2Vec + FiLM | [SugarSquirrel](https://github.com/SugarSquirrel/aicup2026-table-tennis)（第 5 名） | `ttmatch/methods/nn.py` |
-| 左右鏡像資料增強、規則修正 | [jabir95tsai](https://github.com/jabir95tsai/pingpong_aicup_2026)（第 22 名） | `ttmatch/methods/nn.py`、`ttmatch/postprocess.py` |
-| XGBoost / CatBoost 對照 | [lucas6028](https://github.com/lucas6028/AI_CUP_2026_Table_Tennis_Prediction) | `ttmatch/methods/trees.py` |
-| **比分推移特徵**、選手 ID 嵌入 | 本 repo 新增 | `ttmatch/features.py`、`ttmatch/methods/nn.py` |
-
-以上程式碼改寫自各隊公開的 repo，改寫的檔案開頭都標註了出處；原作著作權屬原作者。
-
 ## 一、資料前處理（`ttmatch/data.py`、`ttmatch/features.py`）
 
 ### 樣本的組成
@@ -76,9 +61,9 @@ train 與 test 的每一列是一拍。把「觀測完第 1..t 拍、預測第 t
 
 - **類別特徵 23 個**：性別、局數、下一拍的擊球類型（`next_strikeId`）；倒數第 1 拍的球種／落點／正反手／力道／旋轉／擊球類型（`last_strikeId`）／站位，倒數第 2 拍的球種／落點／正反手／旋轉／力道，倒數第 3 拍的球種／落點；發球拍的球種、旋轉、力道、落點、正反手；**下一拍擊球者的選手 ID**。還沒發生的拍用哨兵類別 50 表示。
 - **數值特徵 27 個**：前綴長度、擊球者是否為發球方、是否在預測接發球／第三拍；發球方與接發方比分、比分差、總分、是否局點、是否 deuce；到目前為止攻擊／控制／防守的次數、落點為 0／1–3（短球區）／7–9（長球區）的次數、平均力道、攻擊比例、最近兩拍是否攻擊等。
-- **選手 target encoding**（`lgbm`、`lgbm_te20`，以及序列模型 `gru`、`transformer`、`gru_t2v_film`、`gru_mirror` 使用；`lgbm_note`、`xgb`、`cat`、`*_pemb` 等不用）：樹模型用 `P(下一拍球種 | 下一拍擊球者)` 等三組，序列模型只用 `P(下一拍球種 | 下一拍擊球者)` 這一組。訓練列的編碼用巢狀 OOF（內層依比賽再切 5 份），避免編碼裡含有自己的答案；第 3 名原本的寫法有這個洩漏，這裡已修正。
+- **選手 target encoding**（`lgbm`、`lgbm_te20`，以及序列模型 `gru`、`transformer`、`gru_t2v_film`、`gru_mirror` 使用；`lgbm_note`、`xgb`、`cat`、`*_pemb` 等不用）：樹模型用 `P(下一拍球種 | 下一拍擊球者)` 等三組，序列模型只用 `P(下一拍球種 | 下一拍擊球者)` 這一組。訓練列的編碼用巢狀 OOF（內層依比賽再切 5 份），避免編碼裡含有自己的答案。
 
-### 本 repo 新增：比分推移特徵（只用於 winner）
+### 比分推移特徵（只用於 winner）
 
 test 裡同一局會出現好幾個 rally。**同一局下一個可見 rally 的開局比分**，揭露了這段期間發球方與接發方各得幾分；若其中一方一分都沒拿到，就能確定本 rally 的勝方。在 train 上用「同局下一個存在的 rally」驗證，只要能判定勝方，與 `serverGetPoint` 的一致率是 100%（13,718 / 13,718 個 rally）。
 
@@ -93,7 +78,7 @@ test 裡同一局會出現好幾個 rally。**同一局下一個可見 rally 的
 
 | 方法 | 類型 | 預測的目標 | 說明 |
 |---|---|---|---|
-| `lgbm` | LightGBM | action、point、winner | 第 3 名的作法：選手 target encoding（action）+ test 內部轉移擴充 |
+| `lgbm` | LightGBM | action、point、winner | 選手 target encoding（action）+ test 內部轉移擴充 |
 | `lgbm_note` | LightGBM | action、point、winner | 同上但不加選手 target encoding（對照） |
 | `lgbm_te20` | LightGBM | action | 選手 target encoding 改用較強的平滑 |
 | `lgbm_noplayer` | LightGBM | action、point | 不用任何選手 ID（對照，量選手身分的重要性） |
@@ -101,11 +86,11 @@ test 裡同一局會出現好幾個 rally。**同一局下一個可見 rally 的
 | `cat` | CatBoost | action、point、winner | 特徵同 `lgbm_note`，類別特徵用 CatBoost 原生處理 |
 | `lgbm_prog` | LightGBM | winner | 加入比分推移特徵 |
 | `cat_prog` | CatBoost | winner | 加入比分推移特徵 |
-| `gru` | GRU | 三個目標 | 第 3 名的因果多任務序列模型 |
+| `gru` | GRU | 三個目標 | 因果多任務序列模型 |
 | `transformer` | 因果 Transformer | 三個目標 | 同上 |
-| `gru_t2v_film` | GRU + Time2Vec + FiLM | 三個目標 | 第 5 名的架構 |
-| `gru_mirror` | GRU | 三個目標 | 左右鏡像資料增強（落點 1↔3、4↔6、7↔9），第 22 名 |
-| `gru_pemb` | GRU | 三個目標 | 用選手 ID 嵌入取代選手 target encoding（本 repo 新增） |
+| `gru_t2v_film` | GRU + Time2Vec + FiLM | 三個目標 | 加入時間編碼與特徵調變的 GRU |
+| `gru_mirror` | GRU | 三個目標 | 左右鏡像資料增強（落點 1↔3、4↔6、7↔9） |
+| `gru_pemb` | GRU | 三個目標 | 用選手 ID 嵌入取代選手 target encoding |
 | `transformer_pemb` | 因果 Transformer | 三個目標 | 同上 |
 
 選這兩類模型的理由：樹模型擅長處理大量類別與手工特徵（例如選手 ID、比分情境），序列模型可以直接讀整串擊球序列。兩者的錯誤型態不同，集成時可以互補。
@@ -139,7 +124,7 @@ test 裡同一局會出現好幾個 rally。**同一局下一個可見 rally 的
 2. **Macro-F1 決策規則**：預測類別 = argmax_c [α · log p_c + w_c]。α 是溫度、w_c 是各類別的偏置，用座標上升調整，讓稀有類別也會被預測到，直接提高 Macro-F1。
 3. **跨半調參**：把比賽分成兩半，決策規則在一半上調、在另一半上評分，兩半互換取平均，避免在同一批資料上調參又評分而高估。
 4. **貪婪集成（優勝劣汰）**：每個目標各自從最佳單一方法開始，依序嘗試加入其他方法（權重 0.1–0.6），只有讓分數至少進步 0.0005 的方法才留下，其餘淘汰。winner 用 AUC 做同樣的選擇。
-5. **另外評估、最後沒有採用**：依前綴長度分組的決策規則、第 22 名的規則修正（預測的類別在同一情境從未出現時改成眾數），兩者在 CV 上的增益都小於 0.0005。
+5. **另外評估、最後沒有採用**：依前綴長度分組的決策規則、規則修正（預測的類別在同一情境從未出現時改成眾數），兩者在 CV 上的增益都小於 0.0005。
 6. 產生提交檔：決策規則在 5 次前綴長度抽樣合併（串接）後的樣本上重新調參後套到 test；test 異常比賽（match 340–354）的 winner 改用不含比分推移的集成。
 
 ## 五、結果
@@ -179,7 +164,7 @@ test 裡同一局會出現好幾個 rally。**同一局下一個可見 rally 的
 
 1. **選手身分是最重要的訊號之一**：拿掉選手 ID（`lgbm_noplayer`），action F1 從 0.369 掉到 0.312。但選手 target encoding 修正洩漏後，反而不如直接把選手 ID 當類別特徵（`lgbm_note` 0.3687 對 `lgbm` 0.3581）。
 2. **序列模型與樹模型互補**：Transformer 是最好的單一 action 模型（0.383），和樹模型集成後 action 到 0.397；point 以 LightGBM 為主。
-3. **第 5 名的 Time2Vec + FiLM、第 22 名的鏡像增強**單獨都沒有勝過基本的 GRU，但鏡像版 GRU 在 point 集成中被選入，提供了多樣性。
+3. **Time2Vec + FiLM、鏡像增強**單獨都沒有勝過基本的 GRU，但鏡像版 GRU 在 point 集成中被選入，提供了多樣性。
 4. **比分推移特徵**讓 winner AUC 從約 0.69 提升到 0.85，overall 約 +0.03。
 
 ## 六、操作說明
