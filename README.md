@@ -49,8 +49,8 @@ train.csv / test.csv
 
 ### 特徵（只用前 k 拍的資訊）
 
-- **類別 23 個**：原始逐拍欄位取最近 3 拍與發球拍，加上性別、局數、**下一拍擊球者的選手 ID**；未發生的拍填 50。
-- **數值 27 個（自行計算）**：比分、比分差、是否局點／deuce；累計攻擊／控制／防守次數、累計落點 0／1–3／7–9 次數、平均力道、攻擊比例、最近兩拍是否攻擊；前綴長度、擊球者是否發球方。
+- **類別 23 個**：原始逐拍欄位取最近 3 拍與發球拍，加上性別、局數、下一拍擊球類型、**下一拍擊球者的選手 ID**；未發生的拍填 50。
+- **數值 27 個（自行計算）**：比分、比分差、是否局點／deuce；累計攻擊／控制／防守次數、累計落點 0／1–3／7–9 次數、發球／接發方攻擊次數差、平均力道、攻擊比例、最近兩拍是否攻擊；前綴長度、擊球者是否發球方、是否預測接發球／第三拍等。
 - **選手 target encoding（TE）**：`P(下一拍球種 | 下一拍擊球者)` 等，即「每位選手過去的打法統計」。樹模型有三組，**只用在 action**（point、winner 都不加）；序列模型一組。用於 `lgbm`、`lgbm_te20` 與 `gru`、`transformer`、`gru_t2v_film`、`gru_mirror`。
 
 ### 比分推移特徵（只用於 winner）
@@ -83,11 +83,11 @@ train.csv / test.csv
 
 ## 三、訓練過程
 
-所有方法共用**依比賽分組的 5-fold**。每個方法輸出 OOF 機率與 5 個 fold 對 test 的平均預測，存成 `outputs/oof/<方法>.npz`。
+所有方法共用同一套 5-fold。每個方法輸出 OOF 機率與 5 個 fold 對 test 的平均預測，存成 `outputs/oof/<方法>.npz`。
 
 **樹模型**（`ttmatch/methods/trees.py`）
 - 三個目標分開訓練；action、point 的類別權重 ∝ 頻率^−0.5，照顧稀有類別；winner 不加權重，也不加 `ap_aug`。
-- action / point 的訓練資料加入 `ap_aug`（權重 ×5），讓模型看到 test 選手的打法。×5 與下方序列模型的 12 epoch、1 seed 都是經驗設定，沒有做系統性搜尋；序列模型受限於本機 CPU 時間。
+- action / point 的訓練資料加入 `ap_aug`（權重 ×5），讓模型看到 test 選手的打法。×5 與序列模型的 epoch、seed 數都是經驗設定，沒有做系統性搜尋；序列模型受限於本機 CPU 時間。
 - LightGBM：lr 0.05、num_leaves 63（winner 47）；XGBoost：lr 0.06、depth 7；CatBoost：lr 0.12、depth 6。皆以驗證 fold 做 early stopping。
 
 **序列模型**（`ttmatch/methods/nn.py`）
@@ -98,7 +98,7 @@ train.csv / test.csv
 
 ## 四、評估與集成（`arena.py`）
 
-1. **Macro-F1 決策規則**：Macro-F1 對每類一視同仁，argmax 會忽略稀有類別；預測 = argmax_c [α·log p_c + w_c]，調整溫度 α 與類別偏置 w_c。
+1. **Macro-F1 決策規則**：argmax 會忽略稀有類別；預測 = argmax_c [α·log p_c + w_c]，調整溫度 α 與類別偏置 w_c。
 2. **貪婪集成**：從最佳單一方法開始逐一加入其他方法（權重 0.1–0.6），分數進步 ≥ 0.0005 才保留；挑選時用快速版決策調參，最後才用完整調參評分。
 3. 未採用：分前綴長度的決策規則、規則修正（CV 增益 < 0.0005）。
 
@@ -148,7 +148,7 @@ train.csv / test.csv
 
 1. **選手身分很重要**：拿掉選手資訊，action F1 從 0.369 降到 0.312。`lgbm`、`lgbm_note` 都有選手 ID 類別特徵，已有 ID 時再加 TE，action F1 反而下降（0.3687 → 0.3581）。
 2. **序列與樹模型互補**：Transformer 是最佳單一 action 模型（0.383），集成後達 0.397。
-3. **比分推移特徵**讓 winner AUC 從約 0.69 升到 0.85，overall 約 +0.03（0.3790 → 0.4090）。
+3. **比分推移特徵**讓 winner AUC 從約 0.69 升到 0.85，overall 約 +0.03。
 
 ## 六、操作說明
 
@@ -197,7 +197,7 @@ python run_method.py transformer gru gru_t2v_film gru_mirror gru_pemb transforme
 |---|---|
 | `--list` | 列出所有方法 |
 | `--device cuda` | 用 GPU 訓練序列模型 |
-| `--epochs`、`--seeds` | 預設 16、2（繳交版本 12、1） |
+| `--epochs`、`--seeds` | 預設 16、2 |
 | `--folds` | fold 數（預設 5） |
 | `--fast` | 快速測試流程，輸出 `*_fast.npz` |
 
@@ -214,7 +214,7 @@ python arena.py --fast
 python arena.py
 ```
 
-輸出 `outputs/submission.csv` 與 `outputs/arena_report.md`（評估與集成報告），約 10–15 分鐘。輸出資料夾可用環境變數 `TTMATCH_OUT_DIR` 改掉（預設 `outputs/`）。選項：`--exclude <方法…>` 排除方法、`--tag <名稱>` 改輸出檔名。test 異常 match（340–354）的 winner 固定使用不含比分推移的集成，沒有參數可關閉。
+輸出 `outputs/submission.csv` 與 `outputs/arena_report.md`（評估與集成報告），約 10–15 分鐘。輸出資料夾可用環境變數 `TTMATCH_OUT_DIR` 改掉（預設 `outputs/`）。選項：`--exclude <方法…>` 排除方法、`--tag <名稱>` 改輸出檔名。
 
 ### 檔案結構
 
@@ -237,8 +237,8 @@ tests/                   單元測試
 
 ## 七、檢討與改進方向
 
-1. **預測分佈要和 test 對照**：樹模型用了 test 內部轉移（`ap_aug`），這些列的下一拍一定存在，使樹模型低估落點 0：繳交版樹模型對 test 的平均 P(落點 0) 約 0.11–0.13，OOF 約 0.15–0.17，只看 CV 分數看不出這個差距。截止後在 [`analysis/post-deadline`](https://github.com/ChiJiun/TTMATCH/tree/analysis/post-deadline) 分支比較 CV 與 test 的預測比例才發現並修正，該分支在截止後版本上估計此項修正約讓 overall +0.02；截止後版本的 private 為 0.401–0.403（Late Submission，不計成績）。
+1. **預測分佈要和 test 對照**：樹模型用了 test 內部轉移（`ap_aug`），這些列的標籤是 test 中已可見、之後還有下一拍的拍，幾乎不會是落點 0，使樹模型低估落點 0：繳交版樹模型對 test 的平均 P(落點 0) 約 0.11–0.13，OOF 約 0.15–0.17，只看 CV 分數看不出這個差距。截止後在 [`analysis/post-deadline`](https://github.com/ChiJiun/TTMATCH/tree/analysis/post-deadline) 分支比較 CV 與 test 的預測比例才發現並修正，該分支在截止後版本上估計此項修正約讓 overall +0.02；截止後版本的 private 為 0.401–0.403（Late Submission，不計成績）。
 2. **評估抽樣對齊 test 的截斷方式**：繳交版 `sample_one_per_rally`（`ttmatch/cv.py:29`）把抽到超過 rally 長度的 k 截到最後一拍，抽樣後 k=1 佔 36.7%，test 為 27.5%。該分支依 test 的前綴長度分佈估計截斷機制，驗證前綴的抽樣與訓練權重都照這個機制，下一步是在對齊後的抽樣上重做集成選擇與決策調參。
 3. **多 seed 與重複 CV**：序列模型目前 1 seed、CV 做一次，方法間 overall 差距多在 0.01 以內。多 seed、重複 CV 與依比賽成對的 bootstrap（該分支已用於版本比較）能讓這類小差距比得更穩。
-4. **依類別分析**：Macro-F1 對稀有類別最敏感。下一步是用現有 OOF 做各類別 F1 與混淆矩陣；該分支的分析顯示 point 的瓶頸在落點 1、3（合計 0.8% 的資料，佔 Macro-F1 的 20%）與落點 7／8／9（F1 0.20–0.28），受落點本身的隨機性限制；下一步是從特徵與預測目標著手（例如把「下一拍是否為 rally 最後一拍（落點 0）」單獨建模），而不是加大模型。
-5. **決策規則與集成的巢狀選擇**：以截止後分支的 arena 重新評估繳交版本：成員、權重、決策都只用另一半比賽挑選，得到巢狀估計 overall 0.4063（action 0.3982、point 0.1943），與 CV 0.4090 相差 0.0027。test 有 14.2% 的列沒有比分推移資訊，在 CV 上隨機挑同比例的比賽模擬這種情況，預期 overall 約 0.4055，介於 public 0.41744（約 1,236 列）與 private 0.39028（約 609 列）之間。下一步是把版本挑選也放進巢狀。
+4. **依類別分析**：Macro-F1 對稀有類別最敏感。繳交版 point 集成（argmax，依 test 前綴長度抽樣的 OOF）各類別 F1：落點 0 為 0.43、落點 9 為 0.31，落點 1、3 只有 0.10、0.03（合計僅 1.2% 的樣本），落點 4 為 0.10，落點 7／8 為 0.17／0.19。下一步是補混淆矩陣，並從特徵與預測目標著手（例如把「下一拍是否為 rally 最後一拍（落點 0）」單獨建模）。
+5. **決策規則與集成的巢狀選擇**：以截止後分支的 arena 重新評估繳交版本（成員、權重、決策只用另一半比賽挑選），巢狀估計 overall 為 0.4063（action 0.3982、point 0.1943），比 CV 低 0.0027。test 有 14.2% 的列沒有比分推移資訊，在 CV 上隨機挑同比例的比賽模擬這種情況，預期 overall 約 0.4055，介於 public 0.41744（約 1,236 列）與 private 0.39028（約 609 列）之間。下一步是把版本挑選也放進巢狀。
