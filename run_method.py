@@ -159,6 +159,19 @@ METHODS = {
                           _trees("xgb", targets=("a", "p"), player_te=False,
                                  extra=tuple(HIST_FEATURES + OHIST_FEATURES + PROG_FEATURES),
                                  factored=True, use_aug=True)),
+    # --- 終結拍分解 + test 轉移擴充，交叉驗證時也加驗證 match 的模擬內部轉移（trees.train_factored 的 sim_aug）：
+    # OOF 與 test 預測是同一種行為。_fs 的轉移列權重 ×5（同 _fa），_fs1 是 ×1 ---
+    **{f"{name}_fs{tag}": (f"{desc}，終結拍分解 + test 轉移擴充 + 驗證 match 的模擬轉移（轉移列權重 ×{mult:g}）",
+                           _trees(kind, targets=("a", "p"), player_te=False, extra=extra, factored=True,
+                                  use_aug=True, sim_aug=True, aug_weight_mult=mult))
+       for tag, mult in (("", 5.0), ("1", 1.0))
+       for name, kind, desc, extra in (
+           ("lgbm_hist", "lgbm", "LightGBM action/point + history", tuple(HIST_FEATURES)),
+           ("lgbm_hist_prog", "lgbm", "LightGBM action/point + history + 比分推移",
+            tuple(HIST_FEATURES + PROG_FEATURES)),
+           ("xgb_hist2", "xgb", "XGBoost action/point + 雙方 history", tuple(HIST_FEATURES + OHIST_FEATURES)),
+           ("xgb_hist2_prog", "xgb", "XGBoost action/point + 雙方 history + 比分推移",
+            tuple(HIST_FEATURES + OHIST_FEATURES + PROG_FEATURES)))},
     "gru": ("因果 GRU 多任務序列模型（第 3 名 0000workjason）", _nn("gru")),
     "transformer": ("因果 Transformer 多任務序列模型（第 3 名 0000workjason）", _nn("transformer")),
     "gru_t2v_film": ("GRU + Time2Vec + FiLM（第 5 名 SugarSquirrel v8）", _nn("t2v_film")),
@@ -194,7 +207,7 @@ def main():
         t0 = time.time()
         print(f">> {name}: {desc}", flush=True)
         out = fn(D, a)
-        out = {k: np.asarray(v, dtype=np.float32) for k, v in out.items()}
+        out = {k: np.asarray(v, dtype=np.int8 if k == "sim_use" else np.float32) for k, v in out.items()}
         out["rally_uid"] = D["ap_base"]["rally_uid"].to_numpy()
         out["prefix_len"] = D["ap_base"]["prefix_len"].to_numpy()
         out["test_rally_uid"] = D["test_pred"]["rally_uid"].to_numpy()

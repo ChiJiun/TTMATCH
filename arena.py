@@ -23,6 +23,7 @@
   python arena.py --no-terminal-update                    # 不做終結拍更新（對照）
   python arena.py --preset final                          # 改善回合 3 的方法集（FINAL_METHODS，含 _fa）
   python arena.py --preset nofa --tag nofa                # 同上但不含 _fa（README 最後採用）→ outputs/submission_nofa.csv
+  python arena.py --preset fs --tag fs                    # nofa 再加 8 個 _fs（截止後分析，沒有上傳）→ outputs/submission_fs.csv
 """
 from __future__ import annotations
 import argparse
@@ -50,7 +51,7 @@ R1_METHODS = [
     "gru_t2v_film", "lgbm_hist", "lgbm_hist2", "lgbm_note", "lgbm_prog", "transformer", "transformer_hist",
     "transformer_hist2", "transformer_pemb", "xgb", "xgb_hist", "xgb_hist2", "xgb_prog",
 ]
-# README「結果」所用的方法集（改善回合 3）。直接分類的樹模型都不用 test 內部轉移擴充；`_fa` 是終結拍分解的
+# 改善回合 3 的方法集（PR #7 的 README 結果）。直接分類的樹模型都不用 test 內部轉移擴充；`_fa` 是終結拍分解的
 # 樹模型，只在「非終結拍」的條件模型裡用 test 內部轉移（見 ttmatch/methods/trees.py）。
 # winner 一律依截斷機制加權；action/point 兩種都放（預設加權，`_eq` 不加權），序列模型含 history 的加權版
 # （`_al`）與不加權版都放，交給貪婪選擇與巢狀估計挑。CatBoost 的 action/point 太慢（單一方法約 1–1.5 小時）
@@ -70,16 +71,28 @@ FINAL_METHODS = [
     "gru_hist_al", "transformer_hist2_al", "transformer_hist2_prog_al", "gru_pemb_hist_al", "transformer_hist2",
     "gru", "transformer", "gru_pemb", "transformer_pemb", "gru_t2v_film", "gru_mirror",
 ]
+# `_fs`：`_fa` 再加上驗證 match 的模擬內部轉移，讓 OOF 與 test 預測是同一種行為（train_factored 的 sim_aug）。
+# `_fs` 的轉移列權重 ×5（與 `_fa` 相同），`_fs1` 是 ×1。
+FS_METHODS = [
+    "lgbm_hist_fs", "lgbm_hist_prog_fs", "xgb_hist2_fs", "xgb_hist2_prog_fs",
+    "lgbm_hist_fs1", "lgbm_hist_prog_fs1", "xgb_hist2_fs1", "xgb_hist2_prog_fs1",
+]
 # 不含比分推移特徵的版本（課堂規則若不允許比分推移時使用）
 PROG_METHODS = {"cat_prog", "cat_prog_bag3", "lgbm_prog", "xgb_prog", "cat_hist_w", "lgbm_hist_w", "xgb_hist_w",
                 "lgbm_hist_prog", "xgb_hist2_prog", "transformer_hist2_prog_al",
-                "lgbm_hist_prog_fa", "xgb_hist2_prog_fa"}
+                "lgbm_hist_prog_fa", "xgb_hist2_prog_fa",
+                "lgbm_hist_prog_fs", "xgb_hist2_prog_fs", "lgbm_hist_prog_fs1", "xgb_hist2_prog_fs1"}
 NOPROG_METHODS = [m for m in FINAL_METHODS if m not in PROG_METHODS]
 # 拿掉終結拍分解樹模型（`_fa`）的版本，README 最後採用的是這一個：`_fa` 在 test 上比 CV 更有把握（見 CONF_WARN），
 # 這部分 CV 量不到；而拿掉之後巢狀估計沒有變差。
 FA_METHODS = {m for m in FINAL_METHODS if m.endswith("_fa")}
 NOFA_METHODS = [m for m in FINAL_METHODS if m not in FA_METHODS]
-PRESETS = {"final": FINAL_METHODS, "nofa": NOFA_METHODS, "noprog": NOPROG_METHODS, "r1": R1_METHODS}
+# `_fs` 的版本（截止後分析）：`nofa` 再加 8 個 `_fs`，也就是回合 3 的方法集把 7 個 `_fa` 換成 `_fs`；
+# `final_fs` 是 `final` 再加 `_fs`（`_fa` 也留著，確認貪婪選擇是不是還會選它們）；`noprog_fs` 拿掉比分推移的方法。
+FS_PRESET = NOFA_METHODS + FS_METHODS
+PRESETS = {"final": FINAL_METHODS, "nofa": NOFA_METHODS, "noprog": NOPROG_METHODS, "r1": R1_METHODS,
+           "fs": FS_PRESET, "final_fs": FINAL_METHODS + FS_METHODS,
+           "noprog_fs": [m for m in FS_PRESET if m not in PROG_METHODS]}
 BLEND_GRID = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
 MIN_GAIN = 5e-4
 # 對照用的方法：樹模型直接併入 test 內部轉移，test 上會低估終結拍（見 ttmatch/methods/trees.py）。
@@ -413,7 +426,7 @@ def main():
     ap.add_argument("--exclude", nargs="*", default=[], help="不納入比較的方法名稱，例如 lgbm_prog cat_prog")
     ap.add_argument("--tag", default="", help="輸出檔名後綴，例如 noprog → submission_noprog.csv")
     ap.add_argument("--no-nested", action="store_true", help="跳過巢狀估計（省時間）")
-    ap.add_argument("--preset", choices=sorted(PRESETS), help="只用預先定義的方法集（final / nofa / noprog / r1）")
+    ap.add_argument("--preset", choices=sorted(PRESETS), help="只用預先定義的方法集（" + " / ".join(sorted(PRESETS)) + "）")
     ap.add_argument("--no-relocate", action="store_true",
                     help="不把 test 打散的 rally 放回原比賽（對照用；OOF 也必須是在同樣設定下訓練的）")
     ap.add_argument("--no-terminal-update", action="store_true",

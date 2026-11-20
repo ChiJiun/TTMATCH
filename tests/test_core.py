@@ -481,6 +481,160 @@ def test_confidence_ignores_terminal_share():
     assert confidence(np.array([[0.0, 0.9, 0.1]]), drop0=True) > confidence(np.array([[0.0, 0.5, 0.5]]), drop0=True)
 
 
+def test_simulated_visible_sets_are_disjoint_and_never_show_last_stroke():
+    """模擬的可見樣式：各組的可見 rally 不重疊、可見前綴一定短於 rally 長度，第 0 組就是 history 特徵用的那一組。"""
+    from ttmatch.history import simulated_visible_sets, visible_prefix_len, _visible_mask
+    rng = np.random.default_rng(3)
+    rows = []
+    for uid in range(400):
+        for sn in range(1, int(rng.integers(2, 8)) + 1):     # 長度 ≥ 2（長度 1 的 rally 沒有前綴，永遠不可見）
+            rows.append(dict(rally_uid=uid, strikeNumber=sn))
+    df = pd.DataFrame(rows)
+    lp, keep = {1: 0.4, 2: 0.3, 3: 0.2, 5: 0.1}, 0.37
+    vis = simulated_visible_sets(df, lp, keep, n_sets=2, seed=11)
+    length = df.groupby("rally_uid")["strikeNumber"].max()
+    k = vis.to_numpy()
+    assert ((k >= 1).sum(1) <= 1).all()                              # 不重疊
+    assert (k <= length.reindex(vis.index).to_numpy()[:, None] - 1).all()   # 看不到最後一拍
+    for c in vis.columns:                                            # 每組的可見比例都接近 keep
+        assert abs((vis[c] >= 1).mean() - keep) < 0.08
+    uniq, k0, inv = visible_prefix_len(df, lp, keep, 11)
+    assert np.array_equal(np.maximum(k0, 0), vis["vis_k0"].reindex(uniq).to_numpy())
+    mask = _visible_mask(df, lp, keep, 11)                           # history 用的遮罩與第 0 組一致
+    assert np.array_equal(mask, df["strikeNumber"].to_numpy() <= df["rally_uid"].map(vis["vis_k0"]).to_numpy())
+
+
+def _sim_plan_case(seed=5, n_rallies=300):
+    rng = np.random.default_rng(seed)
+    uid, plen, k0, k1 = [], [], [], []
+    for r in range(n_rallies):
+        n = int(rng.integers(1, 9))                  # 前綴數（rally 長度 − 1）
+        which = rng.choice([0, 1, 2], p=[0.37, 0.37, 0.26])
+        k = int(rng.integers(1, n + 1))
+        for j in range(1, n + 1):
+            uid.append(r), plen.append(j), k0.append(k if which == 0 else 0), k1.append(k if which == 1 else 0)
+    return np.array(uid), np.array(plen), np.column_stack([k0, k1])
+
+
+def test_sim_transition_plan_never_trains_on_the_stroke_to_predict():
+    """每個驗證列用的模型，訓練資料裡同一個 rally 的列都比它短：要預測的那一拍（第 k+1 拍）與更後面的拍不在訓練裡。"""
+    from ttmatch.methods.trees import sim_transition_plan
+    uid, plen, vis_k = _sim_plan_case()
+    va_idx = np.where(uid % 3 != 0)[0]               # 驗證 fold 只是其中一部分列
+    sim_rows, use = sim_transition_plan(plen, vis_k, va_idx)
+    assert len(sim_rows) == 2 and len(use) == len(va_idx)
+    for g, rows in enumerate(sim_rows):
+        assert np.isin(rows, va_idx).all()                           # 只拿驗證 fold 的列
+        assert (plen[rows] < vis_k[rows, g]).all()                   # 只拿模擬可見前綴內部的轉移
+    trained = [{} for _ in sim_rows]                 # 每個模型：rally → 訓練過的最長前綴
+    for g, rows in enumerate(sim_rows):
+        for i in rows:
+            trained[g][uid[i]] = max(trained[g].get(uid[i], 0), plen[i])
+    n_exact = 0
+    for i, g in zip(va_idx, use):
+        # 訓練列的目標是第 prefix_len + 1 拍：訓練過的最長前綴 < 這一列的前綴 ⇔ 第 k+1 拍以後都沒被訓練過
+        assert trained[g].get(uid[i], 0) < plen[i]
+        k = vis_k[i].max()
+        if k >= 2 and plen[i] == k:                  # 與 test 同條件的列：模型訓練過它自己的第 1..k−1 列
+            assert vis_k[i, g] == k and trained[g][uid[i]] == k - 1
+            n_exact += 1
+    assert n_exact > 20
+    # 只有一組模擬時，可見 rally 較短的前綴沒有乾淨的模型可用 → 直接拒絕
+    try:
+        sim_transition_plan(plen, vis_k[:, :1], va_idx)
+        raise RuntimeError("應該要 assert")
+    except AssertionError:
+        pass
+
+
+def _fake_tree_D(seed=7):
+    """train_factored 用得到的最小資料集；total_points 欄放 rally 編號（test 內部轉移是 −1）以便追蹤訓練列。"""
+    from ttmatch.features import FEATURES
+    uid, plen, vis_k = _sim_plan_case(seed)
+    rng = np.random.default_rng(seed)
+    n_pref = pd.Series(plen).groupby(uid).transform("max").to_numpy()
+
+    def frame(n, uid_col, plen_col):
+        df = pd.DataFrame({c: np.zeros(n, dtype=int) for c in FEATURES})
+        df["prefix_len"], df["total_points"] = plen_col, uid_col
+        df["next_action"], df["next_point"] = rng.integers(0, 15, n), rng.integers(1, 10, n)
+        return df
+
+    base = frame(len(uid), uid, plen)
+    base["rally_uid"], base["match"] = uid, uid // 20
+    base["is_terminal"] = (plen == n_pref).astype(int)
+    base["align_w"], base["sim_aug_w"] = 1.0, 1.0
+    base["vis_k0"], base["vis_k1"] = vis_k[:, 0], vis_k[:, 1]
+    aug = frame(50, -1, rng.integers(1, 4, 50))
+    aug["align_w"] = 1.0
+    return dict(ap_base=base, ap_aug=aug, test_pred=frame(30, -2, rng.integers(1, 5, 30)), cut_g=np.ones(31) / 30)
+
+
+def test_train_factored_sim_aug_has_no_leak(monkeypatch):
+    """端到端：用假的 _fit_predict 記下每個模型的訓練列，確認每個 OOF 列（arena 的評估列是其中一部分）
+    用的非終結條件模型都沒有訓練過同一個 rally 的第 k+1 拍或更後面的拍，early stopping 的列也不在訓練裡。"""
+    from ttmatch.methods import trees
+    from ttmatch.truncation import cut_matched_indices
+    D = _fake_tree_D()
+    base = D["ap_base"]
+    calls = []
+
+    def fake_fit_predict(kind, n_class, X_tr, y_tr, w_tr, X_va, y_va, X_preds, fast, **kw):
+        tr = set(zip(X_tr["total_points"].to_numpy(), X_tr["prefix_len"].to_numpy()))
+        es = set(zip(X_va["total_points"].to_numpy(), X_va["prefix_len"].to_numpy()))
+        calls.append(dict(n_class=n_class, tr=tr, es=es, n_tr=len(X_tr)))
+        if n_class == 2:                      # P(終結) = 0 → OOF 就是非終結條件模型的輸出
+            return [np.zeros(len(X)) for X in X_preds]
+        out = []
+        for X in X_preds:                     # 第 0 欄記下「這是第幾次呼叫」
+            p = np.zeros((len(X), n_class))
+            p[:, 0] = len(calls) - 1
+            out.append(p)
+        return out
+
+    monkeypatch.setattr(trees, "_fit_predict", fake_fit_predict)
+    uid, plen, match = base["rally_uid"].to_numpy(), base["prefix_len"].to_numpy(), base["match"].to_numpy()
+    vis = {int(u): (int(k0), int(k1)) for u, k0, k1 in zip(uid, base["vis_k0"], base["vis_k1"])}
+    eval_rows = set(np.concatenate(cut_matched_indices(base, D["cut_g"], 5)).tolist())
+    for t, n_cls in (("p", 10), ("a", 15)):              # 兩個任務都跑一遍（類別數不同）
+        calls.clear()
+        out = trees.train_factored("lgbm", D, targets=(t,), n_folds=3, sim_aug=True)
+        n_own, n_exact = 0, 0
+        for i in range(len(base)):
+            c = calls[int(round(out[f"oof_{t}"][i, 0]))]
+            assert c["n_class"] == n_cls
+            own = [q for (u, q) in c["tr"] if u == uid[i]]
+            assert all(q < plen[i] for q in own), (uid[i], plen[i], own, i in eval_rows)
+            assert not (c["tr"] & c["es"])
+            n_own += bool(own)
+            k = max(base["vis_k0"].iloc[i], base["vis_k1"].iloc[i])
+            if k >= 2 and plen[i] == k:       # 與 test 同條件：自己的第 1..k−1 列都在訓練裡
+                assert sorted(own) == list(range(1, k))
+                n_exact += 1
+        assert n_exact > 20 and n_own > n_exact
+        # 訓練列除了 test 內部轉移（−1）與其他 fold 的 match，只能有同一個驗證 fold 的「模擬內部轉移」：
+        # 屬於驗證 fold 的 match 的訓練列，都在同一組模擬（g）的可見前綴裡（prefix_len < vis_k_g）
+        multi = [c for c in calls if c["n_class"] == n_cls]
+        n_sim_rows = 0
+        for c in multi:
+            fold_matches = {u // 20 for u, _ in c["es"] if u >= 0}
+            in_fold = [(u, q) for u, q in c["tr"] if u >= 0 and u // 20 in fold_matches]
+            n_sim_rows += len(in_fold)
+            assert any(all(q < vis[u][g] for u, q in in_fold) for g in (0, 1))
+            assert all(vis[u][0] * vis[u][1] == 0 for u, _ in in_fold)      # 兩組可見的 rally 不重疊
+        assert n_sim_rows > 0
+        # 每個非終結條件模型都用了 test 內部轉移；3 個 fold × 2 組模擬
+        nonterminal = [c for c in multi if any(u == -1 for u, _ in c["tr"])]      # action 另有 3 個終結條件模型
+        assert len(nonterminal) == 6 and len(multi) == (6 if t == "p" else 9)
+        # sim_aug=False（既有的 _fa）不受影響：訓練資料裡沒有任何驗證 fold 的列
+        calls.clear()
+        out = trees.train_factored("lgbm", D, targets=(t,), n_folds=3, sim_aug=False)
+        for i in range(len(base)):
+            c = calls[int(round(out[f"oof_{t}"][i, 0]))]
+            fold_matches = {m for u, _ in c["es"] for m in [u // 20]}
+            assert match[i] in fold_matches and not any(u // 20 in fold_matches for u, _ in c["tr"] if u >= 0)
+
+
 def test_nofa_preset_is_final_without_fa():
     """nofa 與 final 只差終結拍分解的樹模型，順序也相同（貪婪選擇的結果會跟候選順序有關）。"""
     from arena import FA_METHODS, PRESETS
@@ -492,3 +646,18 @@ def test_nofa_preset_is_final_without_fa():
     # 順序相同：nofa 是 final 的子序列
     it = iter(final)
     assert all(m in it for m in nofa)
+
+
+def test_fs_presets_replace_fa_with_fs():
+    """`fs` 是 nofa 加上 8 個 `_fs`（也就是 final 把 `_fa` 換成 `_fs`）；`final_fs` 是 final 加 `_fs`；
+    `_fs` 都能用 run_method.py 訓練，而且比分推移的標記與 PROG_METHODS 一致。"""
+    from arena import FS_METHODS, FINAL_METHODS, NOFA_METHODS, PRESETS, PROG_METHODS
+    from run_method import METHODS
+    assert len(FS_METHODS) == 8 and len(set(FS_METHODS)) == 8 and not set(FS_METHODS) & set(FINAL_METHODS)
+    for name in FS_METHODS:
+        assert name in METHODS and METHODS[name][1].uses_prog == (name in PROG_METHODS), name
+    assert PRESETS["fs"] == NOFA_METHODS + FS_METHODS
+    assert PRESETS["final_fs"] == FINAL_METHODS + FS_METHODS
+    assert not any(m.endswith("_fa") for m in PRESETS["fs"] + PRESETS["noprog_fs"])
+    assert not any(METHODS[n][1].uses_prog for n in PRESETS["noprog_fs"])
+    assert set(PRESETS["fs"]) - set(PRESETS["noprog_fs"]) == set(PRESETS["fs"]) & PROG_METHODS
