@@ -13,7 +13,7 @@ Kaggle 課堂競賽 [Introduction to Data Science Competition — TTMATCH](https
 | public | 約 67% | 0.41744 | 截止時第 24 名 |
 | **private（最終成績）** | 約 33% | **0.39028** | **第 17 名／57 隊** |
 
-CV overall 0.4090（巢狀估計 0.4063）；不用比分推移的 CV overall 為 0.3790。
+CV overall 0.4090（截止後重新評估的巢狀估計 0.4063）；不用比分推移的 CV overall 為 0.3790。
 
 ## 任務與流程
 
@@ -91,13 +91,13 @@ train.csv / test.csv
 **樹模型**（`ttmatch/methods/trees.py`）
 - 三個目標分開訓練；action、point 的類別權重 ∝ 頻率^−0.5，照顧稀有類別；winner 不加權重，也不加 `ap_aug`。
 - action / point 的訓練資料加入 `ap_aug`（權重 ×5），讓模型看到 test 選手的打法。×5 與下方序列模型的 12 epoch、1 seed 都是經驗設定，沒有做系統性搜尋；序列模型受限於本機 CPU 時間。
-- LightGBM：lr 0.05、num_leaves 63（winner 47）；XGBoost：lr 0.06、depth 7；CatBoost：lr 0.12、depth 6。皆以驗證 fold 做 early stopping（序列模型沒有，固定 12 epoch）。
+- LightGBM：lr 0.05、num_leaves 63（winner 47）；XGBoost：lr 0.06、depth 7；CatBoost：lr 0.12、depth 6。皆以驗證 fold 做 early stopping。
 
 **序列模型**（`ttmatch/methods/nn.py`）
 - 讀入整個 rally，在每個位置預測下一拍的球種、落點與勝負（因果遮罩）。
 - 輸入：8 個類別欄位嵌入 + 6 個數值 + 拍序位置；皆 2 層、hidden 160。
-- 損失 = 0.4 球種 + 0.4 落點 + 0.2 勝負（同評分權重）；Adam lr 2e-3、cosine 排程、batch 128。
-- 訓練資料包含 test rally 已可見的部分。繳交版本：**1 seed × 12 epoch**。
+- 損失 = 0.4 球種 + 0.4 落點 + 0.2 勝負（同評分權重）；球種、落點的類別權重 ∝ 頻率^−0.5，用全部 `ap_base` 的標籤頻率計算（`nn.py:98–99`）；Adam lr 2e-3、cosine 排程、batch 128。
+- 訓練資料包含 test rally 已可見的部分。繳交版本：**1 seed × 12 epoch**，不做 early stopping。
 
 ## 四、評估與集成（`arena.py`）
 
@@ -113,7 +113,7 @@ train.csv / test.csv
 |---|---|
 | 驗證與訓練的比賽互不重疊 | 依比賽分組的 5-fold（test 與 train 的比賽也不重疊） |
 | TE 不洩漏標籤 | 訓練列用巢狀 OOF；驗證列與 test 用訓練 fold 擬合的編碼 |
-| 驗證分佈貼近 test（多只看得到 1–3 拍） | 依 test 的前綴長度分佈抽樣驗證前綴，重複 5 次 |
+| 驗證前綴長度分佈對齊 test（多只看得到 1–3 拍） | 依 test 的前綴長度分佈抽樣驗證前綴，抽到超過 rally 長度的 k 截到最後一拍，重複 5 次 |
 | 決策規則（α、類別偏置）不過配 | 跨半調參：一半比賽調參、另一半評分，再互換 |
 
 ## 五、結果
@@ -242,7 +242,8 @@ tests/                   單元測試
 
 ## 七、檢討與改進方向
 
-1. **預測分佈要和 test 對照**：樹模型用了 test 內部轉移（`ap_aug`），這些列的下一拍一定存在，使樹模型在 test 上幾乎不預測落點 0，CV 看不出來。截止後在 [`analysis/post-deadline`](https://github.com/ChiJiun/TTMATCH/tree/analysis/post-deadline) 分支比較 CV 與 test 的預測比例才發現並修正，該分支估計此項修正約讓 overall +0.02；加上同場歷史特徵、終結拍更新等改進，截止後版本的 private 為 0.401–0.403（Late Submission，不計成績）。「CV 與 test 預測分佈對照」現在是 arena 報告的固定檢查。
-2. **多 seed 與重複 CV**：序列模型目前 1 seed、CV 做一次，方法間 overall 差距多在 0.01 以內。多 seed、重複 CV 與依比賽成對的 bootstrap（該分支已用於版本比較）能讓這類小差距比得更穩。
-3. **依類別分析**：Macro-F1 對稀有類別最敏感。下一步是用現有 OOF 做各類別 F1 與混淆矩陣；該分支的分析顯示 point 的瓶頸在落點 1、3（合計 0.8% 的資料，佔 Macro-F1 的 20%）與落點 7／8／9（F1 0.20–0.28），可針對這些類別加強。
-4. **決策規則與集成的巢狀選擇**：成員、權重、決策都只用另一半比賽挑選的巢狀估計 overall 為 0.4063（action 0.3982、point 0.1943），與 CV 0.4090 相差 0.0027；依 test 有 14.2% 的列沒有比分推移的比例模擬，預期 overall 約 0.4055。流程穩定，下一步是把版本挑選也放進巢狀。
+1. **預測分佈要和 test 對照**：樹模型用了 test 內部轉移（`ap_aug`），這些列的下一拍一定存在，使樹模型在 test 上預測落點 0 的比例只有 1.4%（修正後 40%），CV 看不出來。截止後在 [`analysis/post-deadline`](https://github.com/ChiJiun/TTMATCH/tree/analysis/post-deadline) 分支比較 CV 與 test 的預測比例才發現並修正，該分支在截止後版本上估計此項修正約讓 overall +0.02；加上同場歷史特徵、終結拍更新等改進，截止後版本的 private 為 0.401–0.403（Late Submission，不計成績）。「CV 與 test 預測分佈對照」已加入該分支 arena 報告的固定檢查。
+2. **評估抽樣對齊 test 的截斷方式**：繳交版 `sample_one_per_rally`（`ttmatch/cv.py:29`）把抽到超過 rally 長度的 k 截到最後一拍，抽樣後 k=1 佔 36.7%，test 為 27.5%。該分支依 test 的前綴長度分佈估計截斷機制，驗證前綴的抽樣與訓練權重都照這個機制，下一步是在對齊後的抽樣上重做集成選擇與決策調參。
+3. **多 seed 與重複 CV**：序列模型目前 1 seed、CV 做一次，方法間 overall 差距多在 0.01 以內。多 seed、重複 CV 與依比賽成對的 bootstrap（該分支已用於版本比較）能讓這類小差距比得更穩。
+4. **依類別分析**：Macro-F1 對稀有類別最敏感。下一步是用現有 OOF 做各類別 F1 與混淆矩陣；該分支的分析顯示 point 的瓶頸在落點 1、3（合計 0.8% 的資料，佔 Macro-F1 的 20%）與落點 7／8／9（F1 0.20–0.28），受落點本身的隨機性限制；下一步是從特徵與預測目標著手（例如把終結拍單獨建模），而不是加大模型。
+5. **決策規則與集成的巢狀選擇**：以截止後分支的 arena 重新評估繳交版本，成員、權重、決策都只用另一半比賽挑選的巢狀估計 overall 為 0.4063（action 0.3982、point 0.1943），與 CV 0.4090 相差 0.0027；依 test 有 14.2% 的列沒有比分推移的比例模擬，預期 overall 約 0.4055。準時繳交的預期 0.4055、public 0.41744（約 1,236 列）、private 0.39028（約 609 列）並列如上。下一步是把版本挑選也放進巢狀。
